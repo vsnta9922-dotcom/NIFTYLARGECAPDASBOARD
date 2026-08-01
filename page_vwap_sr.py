@@ -147,6 +147,7 @@ def render():
     display_cols = [
         "symbol", "day_d_date", "episode_type", "x_price", "classification",
         "status", "current_price", "%_from_x", "gap_pct", "days_tracked",
+        "max_runup_pct", "max_drawdown_pct",
     ]
     display_df = view[display_cols].rename(columns={
         "symbol": "Symbol",
@@ -158,7 +159,9 @@ def render():
         "current_price": "Price",
         "%_from_x": "% From X",
         "gap_pct": "Gap %",
-        "days_tracked": "Trading Days Tracked",
+        "days_tracked": "Days Tracked",
+        "max_runup_pct": "Max Runup %",
+        "max_drawdown_pct": "Max Drawdown %",
     })
 
     def _color_status(val):
@@ -191,6 +194,8 @@ def render():
             "Price": "₹{:.2f}",
             "% From X": "{:+.2f}%",
             "Gap %": "{:.2f}%",
+            "Max Runup %": "{:.2f}%",
+            "Max Drawdown %": "{:.2f}%",
         }, na_rep="—")
     )
 
