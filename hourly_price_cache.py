@@ -168,7 +168,9 @@ def _download_with_timeout(tickers_str: str, timeout_seconds: int, **kwargs):
 
 def _extract(data, sym, n_total):
     """Pulls symbol `sym`'s OHLCV slice out of a (possibly multi-ticker)
-    yf.download() result.  Same logic as price_cache._extract()."""
+    yf.download() result.  IST normalization is applied BEFORE stripping
+    timezone info, so UTC timestamps are correctly converted to IST.
+    Same order the single-symbol path already used correctly."""
     yf_sym = f"{sym}.NS"
     try:
         if isinstance(data.columns, pd.MultiIndex):
@@ -184,12 +186,21 @@ def _extract(data, sym, n_total):
     sub = sub.dropna(how="all")
     if sub.empty:
         return None
-    sub.index = pd.to_datetime(sub.index).tz_localize(None)
+    # CRITICAL FIX: normalize to IST BEFORE stripping tz info.
+    # The old code did sub.index = pd.to_datetime(sub.index).tz_localize(None)
+    # which silently discarded UTC timestamps as if they were already IST.
+    # Now we convert UTC -> IST first, then strip.
+    sub.index = pd.to_datetime(sub.index)
+    if sub.index.tz is not None:
+        sub.index = sub.index.tz_convert("Asia/Kolkata").tz_localize(None)
     return sub
 
 
 def _normalize_ist(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize index to IST (Asia/Kolkata) then strip tz info."""
+    """Normalize index to IST (Asia/Kolkata) then strip tz info.
+    Kept for backward compatibility with the single-symbol fetch path
+    (get_hourly_history), which already calls this after _fetch_with_timeout.
+    The bulk path now handles IST conversion inside _extract()."""
     if df.index.tz is not None:
         df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
     else:
@@ -240,7 +251,8 @@ def bulk_refresh_hourly_histories(symbols: list):
         for sym in chunk:
             fresh = _extract(data, sym, len(chunk))
             if fresh is not None and not fresh.empty:
-                fresh = _normalize_ist(fresh)
+                # _extract() now handles IST normalization inline, so no
+                # need to call _normalize_ist() again here.
                 _save_cache(sym, fresh)
                 _session_refreshed.add(sym)
 
