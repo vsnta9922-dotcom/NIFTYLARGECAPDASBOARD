@@ -104,8 +104,13 @@ def compute_session_summary(hourly_df: pd.DataFrame, daily_hist: pd.DataFrame = 
     rows = []
     for session_date, day_df in df.groupby("_date"):
         day_df = day_df.sort_index()
-        cum_vol = day_df["Volume"].cumsum()
-        cum_pv = (day_df["_typical"] * day_df["Volume"]).cumsum()
+        # Avoid zero-volume bars corrupting the entire session's VWAP:
+        # mask out zero-volume bars from both cumulative sums so they
+        # don't contribute and don't create NaN via division by zero.
+        _vol = day_df["Volume"].replace(0, np.nan)
+        _typical = day_df["_typical"]
+        cum_vol = _vol.cumsum()
+        cum_pv = (_typical * _vol).cumsum()
         vwap_series = cum_pv / cum_vol.replace(0, np.nan)
 
         final_vwap = float(vwap_series.iloc[-1])
@@ -287,7 +292,11 @@ def find_vwap_sr_episodes(daily_hist: pd.DataFrame, session_summary: pd.DataFram
                 "recovered": None, "recovery_date": None, "days_to_recover": None,
             }
 
-        gap_pct = (x_price - first_hour_high) / first_hour_high * 100
+        gap_pct = (
+            (x_price - first_hour_high) / first_hour_high * 100
+            if first_hour_high and first_hour_high != 0
+            else None
+        )
         episodes.append({
             "day_d_date": day_d_date,
             "x_price": x_price,
@@ -369,7 +378,11 @@ def find_vwap_sr_episodes_upper(daily_hist: pd.DataFrame, session_summary: pd.Da
                 "recovered": None, "recovery_date": None, "days_to_recover": None,
             }
 
-        gap_pct = (first_hour_low - x_price) / first_hour_low * 100
+        gap_pct = (
+            (first_hour_low - x_price) / first_hour_low * 100
+            if first_hour_low and first_hour_low != 0
+            else None
+        )
         episodes.append({
             "day_d_date": day_d_date,
             "x_price": x_price,

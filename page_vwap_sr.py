@@ -84,9 +84,11 @@ def render():
             "Click **🔄 Rescan Universe** in the sidebar to run the first scan."
         )
         return
+
     # Normalize day_d_date immediately so all downstream code works with
     # Timestamps (sorting is chronological, not lexicographic on strings).
     vwap_df["day_d_date"] = pd.to_datetime(vwap_df["day_d_date"], errors="coerce")
+
     # Enrich with current price from globals
     g = load_globals()
     merged = g.get("merged")
