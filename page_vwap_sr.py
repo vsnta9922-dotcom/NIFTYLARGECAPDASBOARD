@@ -158,7 +158,7 @@ def render():
         "current_price": "Price",
         "%_from_x": "% From X",
         "gap_pct": "Gap %",
-        "days_tracked": "Days Tracked",
+        "days_tracked": "Trading Days Tracked",
     })
 
     def _color_status(val):
