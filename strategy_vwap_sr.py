@@ -215,6 +215,7 @@ def _normalize_episode_row(ep: dict) -> dict:
         "failed_date": ep.get("failed_date"),
         "failed_price": ep.get("failed_price"),
         "max_runup_pct": ep.get("max_runup_pct"),
+        "max_drawdown_pct": ep.get("max_drawdown_pct"),
         "days_tracked": ep.get("days_tracked"),
         "drawdown_pct": ep.get("drawdown_pct"),
         "drawdown_recovered": ep.get("drawdown_recovered"),
