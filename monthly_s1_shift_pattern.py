@@ -190,7 +190,7 @@ def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date, retest_pct
         status, pos = candidates[0]
         event_date = dates[pos]
         event_price = float(closes[pos])
-        days_tracked = int((event_date - anchor_date).days)
+        days_tracked = len(after.loc[:event_date])
         max_runup_pct = float((running_high[: pos + 1].max() - x_price) / x_price * 100)
         return {
             "status": status,
@@ -202,7 +202,7 @@ def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date, retest_pct
         }
 
     max_runup_pct = float((running_high.max() - x_price) / x_price * 100)
-    days_tracked = int((dates[-1] - anchor_date).days)
+    days_tracked = len(after)
     return {
         "status": "naked", "tested_date": None, "tested_price": None,
         "failed_date": None, "max_runup_pct": max_runup_pct, "days_tracked": days_tracked,
