@@ -28,6 +28,16 @@ upper-band episodes.
 KNOWN LIMITATION (disclosed, not a bug): hourly data is only ever a
 rolling ~2-year window (see hourly_price_cache.py), so Day D detection
 can only ever look as far back as that window.
+
+AUGUST 2026 — CONTINUOUS TRACKING UPDATE:
+  Status, max_runup, and max_drawdown are now evaluated from Day D to
+  TODAY (not frozen at the first event). This gives actionable risk/reward
+  metrics for ongoing episodes:
+    - max_runup_pct:   max % above X from Day D to today (reward potential)
+    - max_drawdown_pct: max peak-to-trough % from any peak after Day D (risk)
+    - status:          latest evaluation — "failed" if ever breached
+                       fail_threshold, "tested" if retested and held,
+                       "naked" if neither.
 """
 import logging
 import numpy as np
@@ -139,59 +149,244 @@ def compute_session_summary(hourly_df: pd.DataFrame, daily_hist: pd.DataFrame = 
     return pd.DataFrame(rows).set_index("date").sort_index()
 
 
-def classify_x_level_resistance(daily_hist: pd.DataFrame, x_price: float, day_d_date,
-                                  retest_pct: float = 5.0, fail_pct: float = 8.0) -> dict:
+def classify_x_level_v2(daily_hist: pd.DataFrame, x_price: float, anchor_date,
+                         retest_pct: float = 5.0, fail_pct: float = 8.0) -> dict:
     """
-    Resistance mirror of classify_x_level.
+    CONTINUOUS TRACKING version of classify_x_level.
+    
+    Evaluates price relative to support level X from anchor_date to TODAY.
+    
+    Returns:
+      status: "failed" | "tested" | "naked"
+        - "failed": price EVER dropped below fail_threshold (X * (1-fail_pct/100))
+        - "tested": price ran away (>= confirm_away) AND retested within retest_pct,
+                    AND never failed
+        - "naked":  never ran away far enough to confirm, or ran away but never
+                    retested, AND never failed
+      
+      tested_date: date of LATEST retest (None if never tested)
+      tested_price: close price at LATEST retest
+      failed_date: date of FIRST failure (None if never failed)
+      failed_price: close price at FIRST failure
+      
+      max_runup_pct: max % above X from anchor_date to today (or to failure)
+                     = (max_high - X) / X * 100
+      max_drawdown_pct: max peak-to-trough drawdown from any peak after anchor_date
+                        to today (or to failure)
+                        = min over all days of (low - running_high) / running_high * 100
+                        (negative number, e.g. -5.0 means 5% drawdown)
+      
+      days_tracked: trading days from anchor_date to today (or to failure)
+    """
+    after = daily_hist.loc[daily_hist.index >= anchor_date]
+    if after.empty or pd.isna(x_price):
+        return {
+            "status": "naked",
+            "tested_date": None, "tested_price": None,
+            "failed_date": None, "failed_price": None,
+            "max_runup_pct": 0.0, "max_drawdown_pct": 0.0,
+            "days_tracked": 0,
+        }
 
+    dates = after.index
+    lows = after["Low"].to_numpy()
+    highs = after["High"].to_numpy()
+    closes = after["Close"].to_numpy()
+
+    fail_threshold = x_price * (1 - fail_pct / 100.0)
+    retest_threshold = x_price * (1 + retest_pct / 100.0)
+    confirm_away = x_price * (1 + 2 * retest_pct / 100.0)
+
+    running_high = np.maximum.accumulate(highs)
+
+    # --- Check for failure ANYWHERE in the history ---
+    fail_mask = lows <= fail_threshold
+    fail_pos = int(np.argmax(fail_mask)) if fail_mask.any() else None
+
+    # If failed, truncate everything at failure point
+    if fail_pos is not None:
+        failure_date = dates[fail_pos]
+        failure_price = float(closes[fail_pos])
+        
+        # Recompute running_high only up to failure
+        highs_to_fail = highs[:fail_pos + 1]
+        running_high_to_fail = np.maximum.accumulate(highs_to_fail)
+        max_high = float(running_high_to_fail.max())
+        max_runup = (max_high - x_price) / x_price * 100
+        
+        # Max drawdown: min of (low - running_high) / running_high up to failure
+        lows_to_fail = lows[:fail_pos + 1]
+        drawdowns = (lows_to_fail - running_high_to_fail) / running_high_to_fail * 100
+        max_drawdown = float(drawdowns.min()) if len(drawdowns) > 0 else 0.0
+        
+        days_tracked = fail_pos + 1  # trading days from anchor to failure
+        
+        return {
+            "status": "failed",
+            "tested_date": None, "tested_price": None,
+            "failed_date": failure_date,
+            "failed_price": failure_price,
+            "max_runup_pct": max_runup,
+            "max_drawdown_pct": max_drawdown,
+            "days_tracked": days_tracked,
+        }
+
+    # --- Not failed — check for retests (ALL retests, keep latest) ---
+    ran_away_mask = highs >= confirm_away
+    tested_date = None
+    tested_price = None
+    
+    if ran_away_mask.any():
+        # Find all "ran away" periods
+        first_away_pos = int(np.argmax(ran_away_mask))
+        # Scan for ALL retests after each "ran away"
+        for away_pos in range(first_away_pos, len(highs)):
+            if highs[away_pos] >= confirm_away:
+                # Look for retest in subsequent bars
+                for j in range(away_pos + 1, len(lows)):
+                    if lows[j] <= retest_threshold:
+                        tested_date = dates[j]
+                        tested_price = float(closes[j])
+                        break  # Keep scanning for later retests
+    
+    # --- Compute continuous max_runup and max_drawdown for full history ---
+    max_high = float(running_high.max())
+    max_runup = (max_high - x_price) / x_price * 100
+    
+    # Drawdown at each point: how far did low drop from the running high?
+    drawdowns = (lows - running_high) / running_high * 100
+    max_drawdown = float(drawdowns.min()) if len(drawdowns) > 0 else 0.0
+    
+    days_tracked = len(after)
+    
+    # --- Determine status ---
+    if tested_date is not None:
+        status = "tested"
+    else:
+        status = "naked"
+    
+    return {
+        "status": status,
+        "tested_date": tested_date,
+        "tested_price": tested_price,
+        "failed_date": None,
+        "failed_price": None,
+        "max_runup_pct": max_runup,
+        "max_drawdown_pct": max_drawdown,
+        "days_tracked": days_tracked,
+    }
+
+
+def classify_x_level_resistance_v2(daily_hist: pd.DataFrame, x_price: float, day_d_date,
+                                     retest_pct: float = 5.0, fail_pct: float = 8.0) -> dict:
+    """
+    CONTINUOUS TRACKING mirror of classify_x_level for resistance levels.
+    
     X is a ceiling established from above (upper-band Day D).
     Favorable move for shorts = price drops below X.
-    - 'tested' : after dropping away, price rallies back to within
-                 retest_pct of X from below.
-    - 'failed' : price breaks above X by fail_pct.
-    - 'max_runup_pct' : max favorable drop below X (negative number).
+    
+    Returns:
+      status: "failed" | "tested" | "naked"
+        - "failed": price EVER broke above fail_threshold (X * (1+fail_pct/100))
+        - "tested": price dropped away (<= confirm_away) AND rallied back within
+                    retest_pct, AND never failed
+        - "naked":  never dropped away far enough, or dropped but never retested
+    
+      tested_date: date of LATEST retest
+      tested_price: close price at LATEST retest
+      failed_date: date of FIRST failure
+      failed_price: close price at FIRST failure
+      
+      max_runup_pct: max % DROP below X from Day D to today (most favorable for shorts)
+                     = (min_low - X) / X * 100 (negative number)
+      max_drawdown_pct: max adverse rally from any trough after Day D
+                        = max peak above trough from any low point (positive number)
+      days_tracked: trading days from Day D to today
     """
     after = daily_hist.loc[daily_hist.index > day_d_date]
     if after.empty:
         return {"status": "naked", "tested_date": None, "tested_price": None,
                 "failed_date": None, "failed_price": None,
-                "max_runup_pct": None, "days_tracked": 0}
+                "max_runup_pct": None, "max_drawdown_pct": None, "days_tracked": 0}
 
-    pct_series = (after["Close"] - x_price) / x_price * 100
-    max_favorable = float(pct_series.min()) if not pct_series.empty else None
-
-    tested_date = None
-    tested_price = None
-    if max_favorable is not None and max_favorable < 0:
-        best_idx = pct_series.idxmin()
-        post_best = after.loc[after.index > best_idx]
-        if not post_best.empty:
-            retest_threshold = x_price * (1 - retest_pct / 100)
-            retest_mask = post_best["Close"] >= retest_threshold
-            if retest_mask.any():
-                tested_date = retest_mask.index[0]
-                tested_price = float(post_best.loc[tested_date, "Close"])
+    dates = after.index
+    lows = after["Low"].to_numpy()
+    highs = after["High"].to_numpy()
+    closes = after["Close"].to_numpy()
 
     fail_threshold = x_price * (1 + fail_pct / 100)
-    fail_mask = after["Close"] >= fail_threshold
-    failed_date = fail_mask.index[0] if fail_mask.any() else None
-    failed_price = float(after.loc[failed_date, "Close"]) if failed_date is not None else None
+    retest_threshold = x_price * (1 - retest_pct / 100)
+    confirm_away = x_price * (1 - 2 * retest_pct / 100)
 
-    if failed_date is not None:
-        status = "failed"
-    elif tested_date is not None:
+    running_low = np.minimum.accumulate(lows)
+
+    # --- Check for failure ANYWHERE ---
+    fail_mask = highs >= fail_threshold
+    fail_pos = int(np.argmax(fail_mask)) if fail_mask.any() else None
+
+    if fail_pos is not None:
+        failure_date = dates[fail_pos]
+        failure_price = float(closes[fail_pos])
+        
+        lows_to_fail = lows[:fail_pos + 1]
+        running_low_to_fail = np.minimum.accumulate(lows_to_fail)
+        min_low = float(running_low_to_fail.min())
+        max_runup = (min_low - x_price) / x_price * 100  # negative = favorable drop
+        
+        highs_to_fail = highs[:fail_pos + 1]
+        drawdowns = (highs_to_fail - running_low_to_fail) / running_low_to_fail * 100
+        max_drawdown = float(drawdowns.max()) if len(drawdowns) > 0 else 0.0
+        
+        days_tracked = fail_pos + 1
+        
+        return {
+            "status": "failed",
+            "tested_date": None, "tested_price": None,
+            "failed_date": failure_date,
+            "failed_price": failure_price,
+            "max_runup_pct": max_runup,
+            "max_drawdown_pct": max_drawdown,
+            "days_tracked": days_tracked,
+        }
+
+    # --- Not failed — check for retests ---
+    dropped_away_mask = lows <= confirm_away
+    tested_date = None
+    tested_price = None
+    
+    if dropped_away_mask.any():
+        first_drop_pos = int(np.argmax(dropped_away_mask))
+        for drop_pos in range(first_drop_pos, len(lows)):
+            if lows[drop_pos] <= confirm_away:
+                for j in range(drop_pos + 1, len(highs)):
+                    if highs[j] >= retest_threshold:
+                        tested_date = dates[j]
+                        tested_price = float(closes[j])
+                        break
+    
+    # --- Continuous metrics ---
+    min_low = float(running_low.min())
+    max_runup = (min_low - x_price) / x_price * 100
+    
+    drawdowns = (highs - running_low) / running_low * 100
+    max_drawdown = float(drawdowns.max()) if len(drawdowns) > 0 else 0.0
+    
+    days_tracked = len(after)
+    
+    if tested_date is not None:
         status = "tested"
     else:
         status = "naked"
-
+    
     return {
         "status": status,
         "tested_date": tested_date,
         "tested_price": tested_price,
-        "failed_date": failed_date,
-        "failed_price": failed_price,
-        "max_runup_pct": max_favorable,
-        "days_tracked": len(after),
+        "failed_date": None,
+        "failed_price": None,
+        "max_runup_pct": max_runup,
+        "max_drawdown_pct": max_drawdown,
+        "days_tracked": days_tracked,
     }
 
 
@@ -247,8 +442,7 @@ def find_vwap_sr_episodes(daily_hist: pd.DataFrame, session_summary: pd.DataFram
     """
     Lower-band episodes: lower_band_close > first_hour_high on Day D.
     X locks at lower_band_close. Natural role: support.
-    min_gap_pct: band must clear the first-hour boundary by at least this
-    percentage to avoid rounding-noise signals (e.g. 1310.62 vs 1310.70).
+    Uses CONTINUOUS TRACKING (v2) for status, max_runup, max_drawdown.
     """
     if session_summary.empty or daily_hist.empty:
         return []
@@ -276,21 +470,12 @@ def find_vwap_sr_episodes(daily_hist: pd.DataFrame, session_summary: pd.DataFram
             change_dates = debounced_above.index[changed_mask]
             classification_changed_date = change_dates[-1] if len(change_dates) else day_d_date
 
-        retest = classify_x_level(daily_hist, x_price, day_d_date,
-                                  retest_pct=retest_pct, fail_pct=fail_pct)
+        retest = classify_x_level_v2(daily_hist, x_price, day_d_date,
+                                     retest_pct=retest_pct, fail_pct=fail_pct)
 
         if min_runup_pct is not None and retest.get("max_runup_pct") is not None:
             if retest["max_runup_pct"] < min_runup_pct:
                 continue
-
-        event_date = retest.get("tested_date") or retest.get("failed_date")
-        if event_date is not None:
-            dd = compute_post_event_drawdown(daily_hist, x_price, event_date)
-        else:
-            dd = {
-                "max_drawdown_pct": None, "lowest_price": None, "lowest_date": None,
-                "recovered": None, "recovery_date": None, "days_to_recover": None,
-            }
 
         gap_pct = (
             (x_price - first_hour_high) / first_hour_high * 100
@@ -309,12 +494,10 @@ def find_vwap_sr_episodes(daily_hist: pd.DataFrame, session_summary: pd.DataFram
             "tested_date": retest["tested_date"],
             "tested_price": retest["tested_price"],
             "failed_date": retest["failed_date"],
+            "failed_price": retest["failed_price"],
             "max_runup_pct": retest["max_runup_pct"],
+            "max_drawdown_pct": retest["max_drawdown_pct"],
             "days_tracked": retest["days_tracked"],
-            "drawdown_pct": dd["max_drawdown_pct"],
-            "drawdown_recovered": dd["recovered"],
-            "drawdown_recovery_date": dd["recovery_date"],
-            "drawdown_days_to_recover": dd["days_to_recover"],
             "episode_type": "lower_band",
         })
 
@@ -329,8 +512,7 @@ def find_vwap_sr_episodes_upper(daily_hist: pd.DataFrame, session_summary: pd.Da
     """
     Upper-band episodes: upper_band_close < first_hour_low on Day D.
     X locks at upper_band_close. Natural role: resistance.
-    min_gap_pct: band must clear the first-hour boundary by at least this
-    percentage to avoid rounding-noise signals.
+    Uses CONTINUOUS TRACKING (v2) for status, max_runup, max_drawdown.
     """
     if session_summary.empty or daily_hist.empty:
         return []
@@ -362,21 +544,12 @@ def find_vwap_sr_episodes_upper(daily_hist: pd.DataFrame, session_summary: pd.Da
             change_dates = debounced_below.index[changed_mask]
             classification_changed_date = change_dates[-1] if len(change_dates) else day_d_date
 
-        retest = classify_x_level_resistance(daily_hist, x_price, day_d_date,
-                                               retest_pct=retest_pct, fail_pct=fail_pct)
+        retest = classify_x_level_resistance_v2(daily_hist, x_price, day_d_date,
+                                                    retest_pct=retest_pct, fail_pct=fail_pct)
 
         if min_runup_pct is not None and retest.get("max_runup_pct") is not None:
             if retest["max_runup_pct"] > -min_runup_pct:
                 continue
-
-        event_date = retest.get("tested_date") or retest.get("failed_date")
-        if event_date is not None:
-            dd = compute_post_event_drawdown_resistance(daily_hist, x_price, event_date)
-        else:
-            dd = {
-                "max_drawdown_pct": None, "lowest_price": None, "lowest_date": None,
-                "recovered": None, "recovery_date": None, "days_to_recover": None,
-            }
 
         gap_pct = (
             (first_hour_low - x_price) / first_hour_low * 100
@@ -395,12 +568,10 @@ def find_vwap_sr_episodes_upper(daily_hist: pd.DataFrame, session_summary: pd.Da
             "tested_date": retest["tested_date"],
             "tested_price": retest["tested_price"],
             "failed_date": retest["failed_date"],
+            "failed_price": retest["failed_price"],
             "max_runup_pct": retest["max_runup_pct"],
+            "max_drawdown_pct": retest["max_drawdown_pct"],
             "days_tracked": retest["days_tracked"],
-            "drawdown_pct": dd["max_drawdown_pct"],
-            "drawdown_recovered": dd["recovered"],
-            "drawdown_recovery_date": dd["recovery_date"],
-            "drawdown_days_to_recover": dd["days_to_recover"],
             "episode_type": "upper_band",
         })
 
