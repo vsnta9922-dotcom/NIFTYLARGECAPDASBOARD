@@ -225,5 +225,6 @@ def _normalize_episode_row(ep: dict) -> dict:
 
 # ── Cached Dashboard Read ─────────────────────────────────────────────────
 
+@st.cache_data(show_spinner=False, ttl=15 * 60)
 def load_vwap_sr_ledger() -> pd.DataFrame:
     return levels_store.get_vwap_sr_episodes()
