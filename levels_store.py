@@ -24,6 +24,10 @@ Key changes vs original:
 
   5. **`_schema_ready` flag** unchanged — schema migration still runs once
      per process, not per connection.
+
+  6. **VWAP S/R Episodes Table** (July 2026) — new table for the VWAP
+     Support/Resistance strategy, with the same batch-write pattern as
+     every other strategy.
 """
 
 import os
@@ -352,6 +356,38 @@ def _run_migrations(conn: sqlite3.Connection):
         ("z_failed_date", "TEXT"), ("z_max_runup_pct", "REAL"),
         ("z_days_tracked", "INTEGER"), ("z_drawdown_pct", "REAL"), ("z_recovery_days", "INTEGER"),
     ])
+    # ── VWAP S/R Episodes Table (July 2026) ───────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS vwap_sr_episodes (
+            symbol                      TEXT    NOT NULL,
+            day_d_date                  TEXT    NOT NULL,
+            episode_type                TEXT    NOT NULL,
+            x_price                     REAL    NOT NULL,
+            first_hour_high             REAL,
+            first_hour_low              REAL,
+            gap_pct                     REAL,
+            classification              TEXT,
+            classification_changed_date TEXT,
+            status                      TEXT,
+            tested_date                 TEXT,
+            tested_price                REAL,
+            failed_date                 TEXT,
+            failed_price                REAL,
+            max_runup_pct               REAL,
+            days_tracked                INTEGER,
+            drawdown_pct                REAL,
+            drawdown_recovered          INTEGER,
+            drawdown_recovery_date      TEXT,
+            drawdown_days_to_recover    INTEGER,
+            first_seen_at               TEXT,
+            last_checked_at             TEXT,
+            PRIMARY KEY (symbol, day_d_date, episode_type)
+        )
+    """)
+    _add_columns_if_missing(conn, "vwap_sr_episodes", [
+        ("first_seen_at", "TEXT"),
+        ("last_checked_at", "TEXT"),
+    ])
 
     # Backfill total_streak_days for any rows where it is NULL (written by older
     # code versions that stored it inconsistently, or added via ALTER TABLE with
@@ -388,6 +424,9 @@ def _run_migrations(conn: sqlite3.Connection):
         ("idx_ep_status",      "ema_pullback_episodes(status)"),
         ("idx_st_symbol",      "supertrend_episodes(symbol)"),
         ("idx_st_status",      "supertrend_episodes(status)"),
+        ("idx_vwap_symbol",    "vwap_sr_episodes(symbol)"),
+        ("idx_vwap_status",    "vwap_sr_episodes(status)"),
+        ("idx_vwap_type",      "vwap_sr_episodes(episode_type)"),
     ]
     for idx_name, idx_spec in _secondary_indexes:
         conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_spec}")
@@ -412,20 +451,11 @@ def batch_upsert_all(per_symbol_data: list[dict]):
 
     `per_symbol_data` is a list of dicts, one per symbol, each with keys:
         symbol, streak_rows, five_leg_rows, pivot_rows, s1_shift_rows,
-        breakout_pullback_rows, ema_pullback_rows, supertrend_rows
+        breakout_pullback_rows, ema_pullback_rows, supertrend_rows,
+        vwap_sr_rows   # NEW July 2026
 
     All strategies are optional per-symbol (pass None or omit the key to skip
-    a strategy for that symbol, e.g. if it errored during detection) -- but
-    every one of the 7 pattern tables is covered here now. Previously this
-    function only batched 4 of the 7 strategies (streak/five_leg/pivot/
-    s1_shift); breakout-pullback, EMA pullback, and Supertrend were added to
-    the dashboard later and always went through their own legacy
-    upsert_*_episodes() calls instead, each opening/closing its own
-    connection per symbol -- silently defeating the whole point of this
-    function for exactly the newest and highest-row-count strategies. That
-    gap is closed here: all 7 upsert-and-purge operations for every symbol
-    now run inside a single BEGIN...COMMIT block, eliminating what was
-    ~7 x N_symbols individual connections/transactions down to 1.
+    a strategy for that symbol, e.g. if it errored during detection).
     """
     conn = _connect()
     now = datetime.now().isoformat()
@@ -451,14 +481,14 @@ def batch_upsert_all(per_symbol_data: list[dict]):
                 _upsert_ema_pullback_conn(conn, sym, item["ema_pullback_rows"], now)
             if item.get("supertrend_rows") is not None:
                 _upsert_supertrend_conn(conn, sym, item["supertrend_rows"], now)
+            if item.get("vwap_sr_rows") is not None:
+                _upsert_vwap_sr_conn(conn, sym, item["vwap_sr_rows"], now)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-
-
 # ---------------------------------------------------------------------------
 # Internal helpers — operate on an already-open connection (no commit/close).
 # ---------------------------------------------------------------------------
@@ -809,6 +839,81 @@ def _upsert_supertrend_conn(conn, symbol: str, rows: list, now: str):
     else:
         conn.execute("DELETE FROM supertrend_episodes WHERE symbol=?", (symbol,))
 
+
+# ── VWAP S/R episodes upsert (July 2026) ──────────────────────────────────
+
+def _upsert_vwap_sr_conn(conn, symbol: str, rows: list, now: str):
+    def _ts(v):
+        if v is None or (hasattr(v, '__class__') and v.__class__.__name__ in ('NaTType',)):
+            return None
+        try:
+            import pandas as pd
+            ts = pd.Timestamp(v)
+            return None if pd.isna(ts) else ts.strftime("%Y-%m-%d")
+        except Exception:
+            return str(v) if v else None
+
+    params = [
+        (
+            symbol, _ts(r["day_d_date"]), r["episode_type"], r["x_price"],
+            r.get("first_hour_high"), r.get("first_hour_low"), r.get("gap_pct"),
+            r.get("classification"), _ts(r.get("classification_changed_date")),
+            r.get("status"), _ts(r.get("tested_date")), r.get("tested_price"),
+            _ts(r.get("failed_date")), r.get("failed_price"),
+            r.get("max_runup_pct"), r.get("days_tracked"),
+            r.get("drawdown_pct"),
+            1 if r.get("drawdown_recovered") else 0,
+            _ts(r.get("drawdown_recovery_date")), r.get("drawdown_days_to_recover"),
+            symbol, _ts(r["day_d_date"]), r["episode_type"], now,
+            now,
+        )
+        for r in rows
+    ]
+    conn.executemany(
+        """
+        INSERT INTO vwap_sr_episodes
+            (symbol, day_d_date, episode_type, x_price, first_hour_high, first_hour_low,
+             gap_pct, classification, classification_changed_date, status,
+             tested_date, tested_price, failed_date, failed_price,
+             max_runup_pct, days_tracked, drawdown_pct, drawdown_recovered,
+             drawdown_recovery_date, drawdown_days_to_recover,
+             first_seen_at, last_checked_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+            COALESCE((SELECT first_seen_at FROM vwap_sr_episodes
+                       WHERE symbol=? AND day_d_date=? AND episode_type=?), ?),
+            ?)
+        ON CONFLICT(symbol, day_d_date, episode_type) DO UPDATE SET
+            x_price=excluded.x_price,
+            first_hour_high=excluded.first_hour_high,
+            first_hour_low=excluded.first_hour_low,
+            gap_pct=excluded.gap_pct,
+            classification=excluded.classification,
+            classification_changed_date=excluded.classification_changed_date,
+            status=excluded.status,
+            tested_date=excluded.tested_date,
+            tested_price=excluded.tested_price,
+            failed_date=excluded.failed_date,
+            failed_price=excluded.failed_price,
+            max_runup_pct=excluded.max_runup_pct,
+            days_tracked=excluded.days_tracked,
+            drawdown_pct=excluded.drawdown_pct,
+            drawdown_recovered=excluded.drawdown_recovered,
+            drawdown_recovery_date=excluded.drawdown_recovery_date,
+            drawdown_days_to_recover=excluded.drawdown_days_to_recover,
+            last_checked_at=excluded.last_checked_at
+        """,
+        params,
+    )
+    if rows:
+        keep = [(_ts(r["day_d_date"]), r["episode_type"]) for r in rows]
+        placeholders = ",".join("(?,?)" for _ in keep)
+        flat = [x for t in keep for x in t]
+        conn.execute(
+            f"DELETE FROM vwap_sr_episodes WHERE symbol=? AND (day_d_date, episode_type) NOT IN ({placeholders})",
+            [symbol, *flat],
+        )
+    else:
+        conn.execute("DELETE FROM vwap_sr_episodes WHERE symbol=?", (symbol,))
 # ---------------------------------------------------------------------------
 # Legacy per-symbol API — kept for backward compatibility (e.g. standalone
 # diagnostic scripts). Each creates/closes its own connection.
@@ -1008,31 +1113,15 @@ def _upsert_breakout_pullback_conn(conn, symbol: str, episodes: list, now: str):
         """,
         params,
     )
-
     if episodes:
-        current_keys = [ep["leg1_start"] for ep in episodes]
-        placeholders = ",".join("?" * len(current_keys))
+        keep_keys = [ep["leg1_start"] for ep in episodes]
+        placeholders = ",".join("?" * len(keep_keys))
         conn.execute(
-            f"DELETE FROM breakout_pullback_episodes WHERE symbol = ? AND leg1_start NOT IN ({placeholders})",
-            (symbol, *current_keys),
+            f"DELETE FROM breakout_pullback_episodes WHERE symbol=? AND leg1_start NOT IN ({placeholders})",
+            [symbol, *keep_keys],
         )
     else:
-        conn.execute("DELETE FROM breakout_pullback_episodes WHERE symbol = ?", (symbol,))
-
-
-def upsert_breakout_pullback_episodes(symbol: str, episodes: list):
-    """
-    Legacy per-symbol API (own connection, own commit) -- kept for backward
-    compatibility (e.g. standalone diagnostic scripts). Prefer routing
-    through batch_upsert_all() for the full-universe refresh path.
-    """
-    conn = _connect()
-    now = datetime.now().isoformat()
-    try:
-        _upsert_breakout_pullback_conn(conn, symbol, episodes, now)
-        conn.commit()
-    finally:
-        conn.close()
+        conn.execute("DELETE FROM breakout_pullback_episodes WHERE symbol=?", (symbol,))
 
 
 def get_breakout_pullback_episodes(status: str = None) -> pd.DataFrame:
@@ -1043,24 +1132,7 @@ def get_breakout_pullback_episodes(status: str = None) -> pd.DataFrame:
         q += " WHERE status = ?"
         params = (status,)
     try:
-        df = _read_sql(conn, q, params)
-    finally:
-        conn.close()
-    return df
-
-
-def upsert_ema_pullback_episodes(symbol: str, episodes: list):
-    """
-    Syncs the ledger for `symbol` with the EMA Pullback Reentry episodes the
-    current run detected: upserts each one (preserving first_seen_at), and
-    DELETES any previously-stored episode for this symbol that the current
-    run no longer produces.
-    """
-    conn = _connect()
-    now = datetime.now().isoformat()
-    try:
-        _upsert_ema_pullback_conn(conn, symbol, episodes, now)
-        conn.commit()
+        return _read_sql(conn, q, params)
     finally:
         conn.close()
 
@@ -1078,35 +1150,35 @@ def get_ema_pullback_episodes(status: str = None) -> pd.DataFrame:
         conn.close()
 
 
-def upsert_supertrend_episodes(symbol: str, episodes: list):
-    """Syncs supertrend 3-phase episodes for symbol."""
+def get_supertrend_episodes(status: str = None) -> pd.DataFrame:
     conn = _connect()
-    now = datetime.now().isoformat()
+    q = "SELECT * FROM supertrend_episodes"
+    params: tuple = ()
+    if status:
+        q += " WHERE status = ?"
+        params = (status,)
     try:
-        _upsert_supertrend_conn(conn, symbol, episodes, now)
-        conn.commit()
+        return _read_sql(conn, q, params)
     finally:
         conn.close()
 
 
-def get_supertrend_episodes(status: str = None, st_period: int = None, st_multiplier: float = None) -> pd.DataFrame:
+# ── VWAP S/R read helper (July 2026) ──────────────────────────────────────
+
+def get_vwap_sr_episodes(status: str = None, episode_type: str = None) -> pd.DataFrame:
     conn = _connect()
-    clauses = []
-    params = []
+    q = "SELECT * FROM vwap_sr_episodes"
+    params: list = []
+    conditions = []
     if status:
-        clauses.append("status = ?"); params.append(status)
-    if st_period is not None:
-        clauses.append("st_period = ?"); params.append(int(st_period))
-    if st_multiplier is not None:
-        clauses.append("st_multiplier = ?"); params.append(float(st_multiplier))
-    q = "SELECT * FROM supertrend_episodes"
-    if clauses:
-        q += " WHERE " + " AND ".join(clauses)
+        conditions.append("status = ?")
+        params.append(status)
+    if episode_type:
+        conditions.append("episode_type = ?")
+        params.append(episode_type)
+    if conditions:
+        q += " WHERE " + " AND ".join(conditions)
     try:
         return _read_sql(conn, q, tuple(params))
     finally:
         conn.close()
-
-
-if __name__ == "__main__":
-    print(get_all_levels().head(20))

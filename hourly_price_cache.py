@@ -20,6 +20,18 @@ This is a DIFFERENT lifecycle model from price_cache.py's daily cache:
 Kept completely separate from price_cache.py (different cache directory,
 different refresh semantics) so this experimental strategy carries zero
 risk to the daily cache every other strategy depends on.
+
+═══════════════════════════════════════════════════════════════════════════
+JULY 2026 — SCALING TO NIFTY 100
+═══════════════════════════════════════════════════════════════════════════
+Added bulk_refresh_hourly_histories() to parallelise the ~100-symbol
+universe refresh.  Previously every symbol was fetched individually via
+yf.Ticker().history() — ~100 sequential network calls taking 60–120s.
+Now chunked yf.download() calls (CHUNK_SIZE=15, same as daily cache)
+with hard timeouts reduce the full-universe refresh to ~15–30s.
+
+A _session_refreshed set (mirroring price_cache.py) prevents double-
+fetching when get_hourly_history() is called after bulk_refresh.
 """
 import concurrent.futures
 import logging
@@ -44,6 +56,15 @@ HOURLY_INTERVAL = "60m"
 REFRESH_TTL_HOURS = 6
 
 BATCH_TIMEOUT_SECONDS = 45
+
+# ── NIFTY 100 scaling: chunked batch parameters ──────────────────────────
+CHUNK_SIZE = 15
+
+# Symbols already refreshed via bulk_refresh_hourly_histories() in THIS
+# process run.  get_hourly_history() checks this first so it never re-
+# issues an individual network request for a symbol the bulk prefetch
+# already just updated.
+_session_refreshed = set()
 
 
 def _cache_path(symbol: str) -> str:
@@ -111,6 +132,119 @@ def _fetch_with_timeout(yf_sym: str, timeout_seconds: int = 30):
         return None
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# BATCH REFRESH — new for NIFTY 100 scaling
+# ───────────────────────────────────────────────────────────────────────────
+
+def _chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def _download_with_timeout(tickers_str: str, timeout_seconds: int, **kwargs):
+    """
+    Runs yf.download() in a background thread and enforces a HARD timeout.
+    Deliberately does NOT use the executor as a context manager — see
+    price_cache._download_with_timeout() for the full rationale.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(yf.download, tickers=tickers_str, progress=False, **kwargs)
+    try:
+        result = future.result(timeout=timeout_seconds)
+        executor.shutdown(wait=False)
+        return result
+    except concurrent.futures.TimeoutError:
+        _log.warning(
+            "[hourly_price_cache] Batch download timed out after %ss for tickers: %s",
+            timeout_seconds, tickers_str[:80] + ("..." if len(tickers_str) > 80 else ""),
+        )
+        executor.shutdown(wait=False)
+        return None
+    except Exception as e:
+        _log.warning("[hourly_price_cache] Batch download failed: %s", e)
+        executor.shutdown(wait=False)
+        return None
+
+
+def _extract(data, sym, n_total):
+    """Pulls symbol `sym`'s OHLCV slice out of a (possibly multi-ticker)
+    yf.download() result.  Same logic as price_cache._extract()."""
+    yf_sym = f"{sym}.NS"
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            if yf_sym not in data.columns.get_level_values(0):
+                return None
+            sub = data[yf_sym]
+        else:
+            sub = data
+    except (KeyError, TypeError):
+        return None
+    if sub is None:
+        return None
+    sub = sub.dropna(how="all")
+    if sub.empty:
+        return None
+    sub.index = pd.to_datetime(sub.index).tz_localize(None)
+    return sub
+
+
+def _normalize_ist(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize index to IST (Asia/Kolkata) then strip tz info."""
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
+    else:
+        _log.warning(
+            "[hourly_price_cache] fetched index has no timezone info — "
+            "assuming it's already IST, but this hasn't been verified against "
+            "live data. Run a spot-check if session boundaries look off.",
+        )
+    return df
+
+
+def bulk_refresh_hourly_histories(symbols: list):
+    """
+    Refreshes the local hourly cache for ALL given symbols using chunked,
+    threaded, timeout-guarded yf.download() calls.
+
+    Unlike the daily cache (which seeds once with period="max" and then
+    only appends), hourly data is a rolling window — we always replace
+    the entire cache file for each symbol with the latest available window.
+
+    This should be called ONCE before a loop that then calls
+    get_hourly_history() per symbol — those calls will find the cache
+    already fresh and skip any further network access.
+    """
+    to_fetch = []
+    for sym in symbols:
+        if not _cache_is_fresh(sym):
+            to_fetch.append(sym)
+
+    if not to_fetch:
+        _log.info("[hourly_price_cache] All %d symbols are fresh — skipping batch refresh.", len(symbols))
+        return
+
+    chunks = list(_chunked(to_fetch, CHUNK_SIZE))
+    for i, chunk in enumerate(chunks, 1):
+        _log.info(
+            "[hourly_price_cache] Batch %d/%d (%d symbols)...",
+            i, len(chunks), len(chunk),
+        )
+        tickers_str = " ".join(f"{s}.NS" for s in chunk)
+        data = _download_with_timeout(
+            tickers_str, BATCH_TIMEOUT_SECONDS,
+            period=HOURLY_PERIOD, interval=HOURLY_INTERVAL,
+            group_by="ticker", auto_adjust=True, threads=False,
+        )
+        if data is None:
+            continue  # fall through to per-symbol fetch later
+        for sym in chunk:
+            fresh = _extract(data, sym, len(chunk))
+            if fresh is not None and not fresh.empty:
+                fresh = _normalize_ist(fresh)
+                _save_cache(sym, fresh)
+                _session_refreshed.add(sym)
+
+
 def get_hourly_history(symbol: str, force_refresh: bool = False) -> pd.DataFrame:
     """
     Returns the rolling-window hourly OHLCV DataFrame for `symbol`
@@ -118,7 +252,15 @@ def get_hourly_history(symbol: str, force_refresh: bool = False) -> pd.DataFrame
     if the local cache is missing, stale (older than REFRESH_TTL_HOURS), or
     `force_refresh=True`. Returns an empty DataFrame if the fetch fails and
     there's no usable cache to fall back on.
+
+    If `symbol` was already refreshed this session via
+    bulk_refresh_hourly_histories(), this just reads the local cache directly.
     """
+    if not force_refresh and symbol in _session_refreshed:
+        cached = _load_cached(symbol)
+        if cached is not None and not cached.empty:
+            return cached
+
     if not force_refresh and _cache_is_fresh(symbol):
         cached = _load_cached(symbol)
         if cached is not None and not cached.empty:
@@ -128,28 +270,7 @@ def get_hourly_history(symbol: str, force_refresh: bool = False) -> pd.DataFrame
     fresh = _fetch_with_timeout(yf_sym)
     if fresh is not None and not fresh.empty:
         fresh.index = pd.to_datetime(fresh.index)
-        # Explicitly normalize to IST (Asia/Kolkata) rather than assuming
-        # yfinance already hands back exchange-local timestamps for .NS
-        # tickers - that assumption was never actually verified against
-        # live data. If the index is tz-aware in some OTHER zone (or UTC),
-        # converting first is essential: grouping bars by calendar date
-        # without this would silently put some bars in the wrong session
-        # near midnight boundaries, throwing off that session's VWAP/band
-        # (and, since first-hour bucketing now takes the session's first
-        # bar directly, could also misidentify which bar IS the first hour).
-        # If the index is naive (no tz info at all), we can't safely assume
-        # what zone it's already in - leave it as-is and flag it, since
-        # silently localizing a naive timestamp risks a wrong assumption in
-        # the OTHER direction.
-        if fresh.index.tz is not None:
-            fresh.index = fresh.index.tz_convert("Asia/Kolkata").tz_localize(None)
-        else:
-            _log.warning(
-                "[hourly_price_cache] %s: fetched index has no timezone info - "
-                "assuming it's already IST, but this hasn't been verified against "
-                "live data. Run a spot-check against a known chart if session "
-                "boundaries look off.", symbol,
-            )
+        fresh = _normalize_ist(fresh)
         _save_cache(symbol, fresh)
         return fresh
 

@@ -212,7 +212,7 @@ def bulk_refresh_histories(symbols: list, refetch_buffer_days: int = 7):
             tickers_str = " ".join(f"{s}.NS" for s in chunk)
             data = _download_with_timeout(
                 tickers_str, BATCH_TIMEOUT_SECONDS,
-                period="max", interval="1d", group_by="ticker", auto_adjust=True, threads=True,
+                period="max", interval="1d", group_by="ticker", auto_adjust=True, threads=False,
             )
             if data is None:
                 continue  # this chunk's symbols fall through to per-symbol fetch later
@@ -232,7 +232,7 @@ def bulk_refresh_histories(symbols: list, refetch_buffer_days: int = 7):
             tickers_str = " ".join(f"{s}.NS" for s in chunk_syms)
             data = _download_with_timeout(
                 tickers_str, BATCH_TIMEOUT_SECONDS,
-                start=earliest_start, interval="1d", group_by="ticker", auto_adjust=True, threads=True,
+                start=earliest_start, interval="1d", group_by="ticker", auto_adjust=True, threads=False,
             )
             if data is None:
                 continue  # falls through to per-symbol fetch later
@@ -246,7 +246,7 @@ def bulk_refresh_histories(symbols: list, refetch_buffer_days: int = 7):
                     else:
                         merged = fresh
                     _save_cache(sym, merged)
-                _session_refreshed.add(sym)  # mark done either way - avoids retrying a bad symbol repeatedly this run
+                    _session_refreshed.add(sym)  # only mark refreshed when data was actually received
 
 
 def _fetch_ticker_history_with_timeout(yf_sym: str, timeout_seconds: int = 30, **kwargs):

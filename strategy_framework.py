@@ -35,6 +35,7 @@ selection state to dashboard_core's existing chart builders and
 render_strategy_multi_chart_grid(), all of which are imported unmodified.
 """
 from dataclasses import dataclass
+from typing import Any, Dict, List
 from typing import Callable, Optional
 
 import pandas as pd
@@ -65,6 +66,15 @@ class StrategyConfig:
     extra_style_fn: Optional[Callable] = None
     max_compare: int = 6
     frozen_columns: tuple = ("Symbol", "Status")  # pinned left, per the "freeze Selection/Symbol/Status" requirement
+@dataclass         
+class StrategyResult:
+    config: StrategyConfig
+    signal: str
+    trend: str
+    strength: float
+    confidence: float
+    metadata: dict
+    raw_data: pd.DataFrame
 
 
 # Selection count -> compare-grid layout, exactly the mapping requested:
