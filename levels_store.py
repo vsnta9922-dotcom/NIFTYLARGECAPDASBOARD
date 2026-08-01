@@ -374,6 +374,7 @@ def _run_migrations(conn: sqlite3.Connection):
             failed_date                 TEXT,
             failed_price                REAL,
             max_runup_pct               REAL,
+            max_drawdown_pct            REAL,
             days_tracked                INTEGER,
             drawdown_pct                REAL,
             drawdown_recovered          INTEGER,
@@ -387,6 +388,7 @@ def _run_migrations(conn: sqlite3.Connection):
     _add_columns_if_missing(conn, "vwap_sr_episodes", [
         ("first_seen_at", "TEXT"),
         ("last_checked_at", "TEXT"),
+        ("max_drawdown_pct", "REAL"),
     ])
 
     # Backfill total_streak_days for any rows where it is NULL (written by older
@@ -860,7 +862,7 @@ def _upsert_vwap_sr_conn(conn, symbol: str, rows: list, now: str):
             r.get("classification"), _ts(r.get("classification_changed_date")),
             r.get("status"), _ts(r.get("tested_date")), r.get("tested_price"),
             _ts(r.get("failed_date")), r.get("failed_price"),
-            r.get("max_runup_pct"), r.get("days_tracked"),
+            r.get("max_runup_pct"), r.get("max_drawdown_pct"), r.get("days_tracked"),
             r.get("drawdown_pct"),
             1 if r.get("drawdown_recovered") else 0,
             _ts(r.get("drawdown_recovery_date")), r.get("drawdown_days_to_recover"),
@@ -875,10 +877,10 @@ def _upsert_vwap_sr_conn(conn, symbol: str, rows: list, now: str):
             (symbol, day_d_date, episode_type, x_price, first_hour_high, first_hour_low,
              gap_pct, classification, classification_changed_date, status,
              tested_date, tested_price, failed_date, failed_price,
-             max_runup_pct, days_tracked, drawdown_pct, drawdown_recovered,
+             max_runup_pct, max_drawdown_pct, days_tracked, drawdown_pct, drawdown_recovered,
              drawdown_recovery_date, drawdown_days_to_recover,
              first_seen_at, last_checked_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
             COALESCE((SELECT first_seen_at FROM vwap_sr_episodes
                        WHERE symbol=? AND day_d_date=? AND episode_type=?), ?),
             ?)
@@ -895,6 +897,7 @@ def _upsert_vwap_sr_conn(conn, symbol: str, rows: list, now: str):
             failed_date=excluded.failed_date,
             failed_price=excluded.failed_price,
             max_runup_pct=excluded.max_runup_pct,
+            max_drawdown_pct=excluded.max_drawdown_pct,
             days_tracked=excluded.days_tracked,
             drawdown_pct=excluded.drawdown_pct,
             drawdown_recovered=excluded.drawdown_recovered,
