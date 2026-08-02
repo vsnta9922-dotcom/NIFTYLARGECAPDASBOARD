@@ -145,7 +145,9 @@ def classify_x_level_resistance(daily_hist: pd.DataFrame, x_price: float, day_d_
     - 'failed' : price breaks above X by fail_pct.
     - 'max_runup_pct' : max favorable drop below X (negative number).
     """
-    after = daily_hist.loc[daily_hist.index > day_d_date]
+    # Normalize dates to midnight to avoid timezone/time-of-day mismatches.
+    day_d_norm = pd.Timestamp(day_d_date).normalize()
+    after = daily_hist.loc[daily_hist.index.normalize() > day_d_norm]
     if after.empty:
         return {"status": "naked", "tested_date": None, "tested_price": None,
                 "failed_date": None, "failed_price": None,
@@ -153,6 +155,11 @@ def classify_x_level_resistance(daily_hist: pd.DataFrame, x_price: float, day_d_
 
     pct_series = (after["Close"] - x_price) / x_price * 100
     max_favorable = float(pct_series.min()) if not pct_series.empty else None
+    # Sanity cap: for large-cap NSE stocks, a >50% move in the tracking
+    # window is almost always a data artefact (split, bad tick, or date
+    # misalignment).  Resistance run-up is negative (price drop below X).
+    if max_favorable is not None:
+        max_favorable = max(-50.0, min(50.0, max_favorable))
 
     tested_date = None
     tested_price = None
@@ -224,7 +231,7 @@ def compute_post_event_drawdown_resistance(daily_hist: pd.DataFrame, x_price: fl
         days_to_recover = (recovery_date - max_date).days
 
     return {
-        "max_drawdown_pct": max_pct,
+        "max_drawdown_pct": -max_pct,   # negative = adverse for a short position
         "lowest_price": max_price,
         "lowest_date": max_date,
         "recovered": recovered,

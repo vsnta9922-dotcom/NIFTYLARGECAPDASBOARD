@@ -148,7 +148,11 @@ def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date, retest_pct
     % price ran up away from x_price before the resolving event, or before
     "now" if still naked) and days_tracked.
     """
-    after = hist.loc[hist.index >= anchor_date]
+    # Normalize dates to midnight to avoid timezone/time-of-day mismatches
+    # when the index has timestamps (e.g. 09:15+05:30) and anchor_date is
+    # a plain date or midnight UTC.
+    anchor_norm = pd.Timestamp(anchor_date).normalize()
+    after = hist.loc[hist.index.normalize() >= anchor_norm]
     if after.empty or pd.isna(x_price):
         return {
             "status": "naked", "tested_date": None, "tested_price": None,
@@ -190,8 +194,11 @@ def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date, retest_pct
         status, pos = candidates[0]
         event_date = dates[pos]
         event_price = float(closes[pos])
-        days_tracked = len(after.loc[:event_date])
+        days_tracked = int((event_date - anchor_norm).days)
         max_runup_pct = float((running_high[: pos + 1].max() - x_price) / x_price * 100)
+        # Sanity cap: >50% run-up on a large-cap NSE stock is almost always a
+        # data artefact (split, bad tick, or date misalignment).
+        max_runup_pct = max(-50.0, min(50.0, max_runup_pct))
         return {
             "status": status,
             "tested_date": event_date if status == "tested" else None,
@@ -202,7 +209,8 @@ def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date, retest_pct
         }
 
     max_runup_pct = float((running_high.max() - x_price) / x_price * 100)
-    days_tracked = len(after)
+    max_runup_pct = max(-50.0, min(50.0, max_runup_pct))
+    days_tracked = int((dates[-1] - anchor_norm).days)
     return {
         "status": "naked", "tested_date": None, "tested_price": None,
         "failed_date": None, "max_runup_pct": max_runup_pct, "days_tracked": days_tracked,
