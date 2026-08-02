@@ -100,37 +100,43 @@ def compute_session_summary(hourly_df: pd.DataFrame, daily_hist: pd.DataFrame = 
     df["_date"] = df.index.date
     df["_typical"] = (df["High"] + df["Low"] + df["Close"]) / 3.0
 
-    rows = []
-    for session_date, day_df in df.groupby("_date"):
-        day_df = day_df.sort_index()
-        cum_vol = day_df["Volume"].cumsum()
-        cum_pv = (day_df["_typical"] * day_df["Volume"]).cumsum()
-        vwap_series = cum_pv / cum_vol.replace(0, np.nan)
+    # ── Vectorized per-session VWAP + 1-SD bands ─────────────────────────
+    # Cumulative volume and price×volume within each trading day.
+    df = df.sort_index()
+    df["_cum_vol"] = df.groupby("_date")["Volume"].cumsum()
+    df["_cum_pv"] = (df["_typical"] * df["Volume"]).groupby(df["_date"]).cumsum()
+    df["_vwap"] = df["_cum_pv"] / df["_cum_vol"].replace(0, np.nan)
 
-        final_vwap = float(vwap_series.iloc[-1])
-        sq_dev = (day_df["_typical"] - final_vwap) ** 2
-        cum_var = (sq_dev * day_df["Volume"]).cumsum() / cum_vol.replace(0, np.nan)
-        stdev_series = np.sqrt(cum_var)
-        lower_band_series = vwap_series - stdev_series
-        upper_band_series = vwap_series + stdev_series
+    # Broadcast the *final* VWAP of each session to every bar in that session
+    # (this matches the Zerodha convention documented in the docstring).
+    df["_final_vwap"] = df.groupby("_date")["_vwap"].transform("last")
 
-        first_hour_bars = day_df.iloc[[0]]
-        if first_hour_bars.empty:
-            continue
+    # Per-bar squared deviation from the session's final VWAP, then cumulative
+    # variance weighted by volume.
+    df["_sq_dev"] = (df["_typical"] - df["_final_vwap"]) ** 2
+    df["_cum_var"] = (df["_sq_dev"] * df["Volume"]).groupby(df["_date"]).cumsum()
+    df["_cum_var"] = df["_cum_var"] / df["_cum_vol"].replace(0, np.nan)
+    df["_stdev"] = np.sqrt(df["_cum_var"])
+    df["_lower"] = df["_vwap"] - df["_stdev"]
+    df["_upper"] = df["_vwap"] + df["_stdev"]
 
-        rows.append({
-            "date": pd.Timestamp(session_date),
-            "first_hour_high": float(first_hour_bars["High"].max()),
-            "first_hour_low": float(first_hour_bars["Low"].min()),
-            "vwap_close": float(vwap_series.iloc[-1]),
-            "lower_band_close": float(lower_band_series.iloc[-1]),
-            "upper_band_close": float(upper_band_series.iloc[-1]),
-            "has_zero_volume_bar": bool((day_df["Volume"] == 0).any()),
-        })
+    # ── Collapse to one row per session ──────────────────────────────────
+    # First bar of each day = first_hour; last bar = close values.
+    first_bar = df.groupby("_date").first()
+    last_bar = df.groupby("_date").last()
+    has_zero = df.groupby("_date")["Volume"].apply(lambda s: (s == 0).any())
 
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).set_index("date").sort_index()
+    rows = pd.DataFrame({
+        "date": pd.to_datetime(last_bar.index),
+        "first_hour_high": first_bar["High"].astype(float),
+        "first_hour_low": first_bar["Low"].astype(float),
+        "vwap_close": last_bar["_vwap"].astype(float),
+        "lower_band_close": last_bar["_lower"].astype(float),
+        "upper_band_close": last_bar["_upper"].astype(float),
+        "has_zero_volume_bar": has_zero.values,
+    }).set_index("date").sort_index()
+
+    return rows
 
 
 def classify_x_level_resistance(daily_hist: pd.DataFrame, x_price: float, day_d_date,
