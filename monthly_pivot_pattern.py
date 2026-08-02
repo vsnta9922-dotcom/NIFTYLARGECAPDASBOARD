@@ -265,7 +265,7 @@ def compute_post_event_drawdown(hist: pd.DataFrame, level: float, event_date):
         lowest Low reached between event_date and that recovery date.
 
     Returns a dict:
-      max_drawdown_pct   - how far below `level` price dipped (positive %),
+      max_drawdown_pct   - how far below `level` price dipped (negative %),
                            or 0.0 if it never went below at all.
       lowest_price        - the actual lowest price reached in the window.
       lowest_date         - the date of that low.
@@ -320,7 +320,7 @@ def compute_post_event_drawdown(hist: pd.DataFrame, level: float, event_date):
     lowest_pos = int(np.argmin(window_lows))
     lowest_price = float(window_lows[lowest_pos])
     lowest_date = window_dates[lowest_pos]
-    max_drawdown_pct = max(0.0, (level - lowest_price) / level * 100)
+    max_drawdown_pct = -max(0.0, (level - lowest_price) / level * 100)
 
     return {
         "max_drawdown_pct": max_drawdown_pct,
