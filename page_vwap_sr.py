@@ -85,10 +85,6 @@ def render():
         )
         return
 
-    # Normalize day_d_date immediately so all downstream code works with
-    # Timestamps (sorting is chronological, not lexicographic on strings).
-    vwap_df["day_d_date"] = pd.to_datetime(vwap_df["day_d_date"], errors="coerce")
-
     # Enrich with current price from globals
     g = load_globals()
     merged = g.get("merged")
@@ -98,12 +94,9 @@ def render():
     else:
         vwap_df["current_price"] = np.nan
 
-    # Guard against zero / NaN / inf x_price before computing % from X
-    _x = pd.to_numeric(vwap_df["x_price"], errors="coerce")
-    _x = _x.replace([0, np.inf, -np.inf], np.nan)
     vwap_df["%_from_x"] = np.where(
-        _x.notna(),
-        (vwap_df["current_price"] - _x) / _x * 100,
+        vwap_df["x_price"].fillna(0) != 0,
+        (vwap_df["current_price"] - vwap_df["x_price"]) / vwap_df["x_price"] * 100,
         np.nan,
     )
 
@@ -139,6 +132,7 @@ def render():
     view = view[view["%_from_x"].abs() <= prox_band]
 
     view = view.copy()
+    view["day_d_date"] = pd.to_datetime(view["day_d_date"], errors="coerce")
     view = view.sort_values("day_d_date", ascending=False).reset_index(drop=True)
 
     st.caption(f"Showing {len(view)} of {len(vwap_df)} recorded episodes")
@@ -147,7 +141,8 @@ def render():
     display_cols = [
         "symbol", "day_d_date", "episode_type", "x_price", "classification",
         "status", "current_price", "%_from_x", "gap_pct", "days_tracked",
-        "max_runup_pct", "max_drawdown_pct",
+        "max_runup_pct", "drawdown_pct", "drawdown_recovered",
+        "drawdown_recovery_date", "drawdown_days_to_recover",
     ]
     display_df = view[display_cols].rename(columns={
         "symbol": "Symbol",
@@ -161,7 +156,10 @@ def render():
         "gap_pct": "Gap %",
         "days_tracked": "Days Tracked",
         "max_runup_pct": "Max Runup %",
-        "max_drawdown_pct": "Max Drawdown %",
+        "drawdown_pct": "Max Drawdown %",
+        "drawdown_recovered": "DD Recovered",
+        "drawdown_recovery_date": "DD Recovery Date",
+        "drawdown_days_to_recover": "DD Days to Recover",
     })
 
     def _color_status(val):
@@ -180,13 +178,25 @@ def render():
             return "color:#e74c3c; font-weight:600"
         return ""
 
+    def _color_pct(val):
+        if pd.isna(val):
+            return ""
+        return "color:#1a7f37;font-weight:600" if val >= 0 else "color:#b91c1c;font-weight:600"
+
+    def _color_dd(val):
+        if pd.isna(val):
+            return ""
+        return "color:#b91c1c;font-weight:600" if val < 0 else "color:#1a7f37;font-weight:600"
+
     styled = (
         display_df.style
         .map(_color_status, subset=["Status"])
         .map(_color_type, subset=["Type"])
+        .map(_color_pct, subset=["% From X", "Max Runup %"])
+        .map(_color_dd, subset=["Max Drawdown %"])
         .map(
-            lambda v: "" if pd.isna(v) else ("color:#1a7f37;font-weight:600" if v >= 0 else "color:#b91c1c;font-weight:600"),
-            subset=["% From X"],
+            lambda v: "color:#27ae60;font-weight:600" if v is True else ("color:#b91c1c" if v is False else ""),
+            subset=["DD Recovered"],
         )
         .format({
             "Day D Date": lambda d: pd.to_datetime(d).strftime("%d-%b-%Y"),
@@ -196,6 +206,8 @@ def render():
             "Gap %": "{:.2f}%",
             "Max Runup %": "{:.2f}%",
             "Max Drawdown %": "{:.2f}%",
+            "DD Recovery Date": lambda d: pd.to_datetime(d).strftime("%d-%b-%Y") if pd.notna(d) else "—",
+            "DD Days to Recover": "{:.0f}",
         }, na_rep="—")
     )
 
