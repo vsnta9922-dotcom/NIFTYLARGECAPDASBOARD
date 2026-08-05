@@ -1,0 +1,29 @@
+diff --git a/vwap_support_resistance_pattern.py b/vwap_support_resistance_pattern.py
+--- a/vwap_support_resistance_pattern.py
++++ b/vwap_support_resistance_pattern.py
+@@ -287,7 +287,11 @@
+                 "recovered": None, "recovery_date": None, "days_to_recover": None,
+             }
+
+-        gap_pct = (x_price - first_hour_high) / first_hour_high * 100
++        gap_pct = (
++            (x_price - first_hour_high) / first_hour_high * 100
++            if first_hour_high and first_hour_high != 0
++            else None
++        )
+         episodes.append({
+             "day_d_date": day_d_date,
+             "x_price": x_price,
+@@ -369,7 +373,11 @@
+                 "recovered": None, "recovery_date": None, "days_to_recover": None,
+             }
+
+-        gap_pct = (first_hour_low - x_price) / first_hour_low * 100
++        gap_pct = (
++            (first_hour_low - x_price) / first_hour_low * 100
++            if first_hour_low and first_hour_low != 0
++            else None
++        )
+         episodes.append({
+             "day_d_date": day_d_date,
+             "x_price": x_price,

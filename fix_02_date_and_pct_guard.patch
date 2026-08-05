@@ -1,0 +1,40 @@
+diff --git a/page_vwap_sr.py b/page_vwap_sr.py
+--- a/page_vwap_sr.py
++++ b/page_vwap_sr.py
+@@ -82,6 +82,10 @@
+         )
+         return
+
++    # Normalize day_d_date immediately so all downstream code works with
++    # Timestamps (sorting is chronological, not lexicographic on strings).
++    vwap_df["day_d_date"] = pd.to_datetime(vwap_df["day_d_date"], errors="coerce")
++
+     # Enrich with current price from globals
+     g = load_globals()
+     merged = g.get("merged")
+@@ -91,11 +95,14 @@
+     else:
+         vwap_df["current_price"] = np.nan
+
+-    vwap_df["%_from_x"] = np.where(
+-        vwap_df["x_price"].fillna(0) != 0,
+-        (vwap_df["current_price"] - vwap_df["x_price"]) / vwap_df["x_price"] * 100,
+-        np.nan,
++    # Guard against zero / NaN / inf x_price before computing % from X
++    _x = pd.to_numeric(vwap_df["x_price"], errors="coerce")
++    _x = _x.replace([0, np.inf, -np.inf], np.nan)
++    vwap_df["%_from_x"] = np.where(
++        _x.notna(),
++        (vwap_df["current_price"] - _x) / _x * 100,
++        np.nan,
+     )
+
+     # ── Filters ───────────────────────────────────────────────────────────
+@@ -128,8 +135,6 @@
+     view = view[view["%_from_x"].abs() <= prox_band]
+
+     view = view.copy()
+-    view["day_d_date"] = pd.to_datetime(view["day_d_date"], errors="coerce")
+     view = view.sort_values("day_d_date", ascending=False).reset_index(drop=True)
+
+     st.caption(f"Showing {len(view)} of {len(vwap_df)} recorded episodes")

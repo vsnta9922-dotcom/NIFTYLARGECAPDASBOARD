@@ -1,4 +1,4 @@
-"""
+"""[source: 3]
 dashboard_core.py
 ------------------
 PILOT extraction — Phase 1 of the StrategyPage architecture refactor.
@@ -42,6 +42,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 
@@ -54,6 +55,7 @@ import monthly_s1_shift_pattern
 import breakout_pullback_pattern
 import ema_pullback_pattern
 import supertrend_pattern
+import range_breakout_pattern
 import confluence_score
 import fundamental_score
 
@@ -263,6 +265,8 @@ def fetch_metrics(
     fail_pct: float = 8.0,
     min_qualify_days: int = 50,
     st_params_list: list = None,
+    range_breakout_retest_pct: float = 5.0,
+    range_breakout_fail_pct: float = 8.0,
 ):
     """
     Pulls each symbol's full growing local price history (see price_cache.py),
@@ -273,6 +277,7 @@ def fetch_metrics(
     """
     if st_params_list is None:
         st_params_list = [(7, 3.0)]
+    
     rows = []
 
     # Collects one dict per symbol with every strategy's ledger rows, so a
@@ -599,6 +604,44 @@ def fetch_metrics(
                 st_ledger_rows = None
                 _log.warning("[supertrend_pattern] Skipping %s", sym, exc_info=True)
 
+            # --- Range Breakout (5-Leg) Pattern ---
+            range_breakout_rows = None
+            try:
+                rb_episodes = range_breakout_pattern.find_range_breakout_episodes(
+                    hist,
+                    retest_pct=range_breakout_retest_pct,
+                    fail_pct=range_breakout_fail_pct,
+                )
+                range_breakout_rows = []
+                for ep in rb_episodes:
+                    range_breakout_rows.append({
+                        "leg1_start": _ts(ep["leg1_start"]),
+                        "leg1_end": _ts(ep.get("leg1_end")),
+                        "leg2_start": _ts(ep.get("leg2_start")),
+                        "leg2_end": _ts(ep.get("leg2_end")),
+                        "leg3_start": _ts(ep.get("leg3_start")),
+                        "leg3_end": _ts(ep.get("leg3_end")),
+                        "leg4_start": _ts(ep.get("leg4_start")),
+                        "leg4_end": _ts(ep.get("leg4_end")),
+                        "leg5_start": _ts(ep.get("leg5_start")),
+                        "leg5_end": _ts(ep.get("leg5_end")),
+                        "leg1_high": ep.get("leg1_high"),
+                        "leg2_low_pivot": ep.get("leg2_low_pivot"),
+                        "leg2_low_price": ep.get("leg2_low_price"),
+                        "leg3_max_pivot": ep.get("leg3_max_pivot"),
+                        "leg4_min_pivot": ep.get("leg4_min_pivot"),
+                        "leg4_min_low": ep.get("leg4_min_low"),
+                        "leg5_last_pivot": ep.get("leg5_last_pivot"),
+                        "leg5_max_pivot": ep.get("leg5_max_pivot"),
+                        "status": ep.get("status"),
+                        "pattern_type": ep.get("pattern_type"),
+                        "breakout_confirmed": 1 if ep.get("breakout_confirmed") else 0,
+                        "is_ongoing": 1 if ep.get("is_ongoing") else 0,
+                    })
+            except Exception as e:
+                range_breakout_rows = None
+                _log.warning("[range_breakout_pattern] Skipping %s", sym, exc_info=True)
+
             above_series = close > ema200_series
             days_in_state, currently_above = _current_streak(above_series)
             trend_days_signed = days_in_state if currently_above else -days_in_state
@@ -632,6 +675,7 @@ def fetch_metrics(
                 "breakout_pullback_rows": bp_ledger_rows,
                 "ema_pullback_rows": ep_ledger_rows,
                 "supertrend_rows": st_ledger_rows,
+                "range_breakout_rows": range_breakout_rows,
             })
 
             # Main table keeps showing the MOST RECENT completed streak, for continuity.
@@ -1296,8 +1340,6 @@ def build_s1_shift_chart(hist: pd.DataFrame, symbol: str, ep_row: pd.Series, per
     return fig
 
 
-
-
 def build_breakout_pullback_chart(hist: pd.DataFrame, symbol: str, ep_row: pd.Series, period: str) -> go.Figure:
     """
     Breakout-Pullback 4-Leg chart.
@@ -1433,6 +1475,86 @@ def build_ema_pullback_chart(hist: pd.DataFrame, symbol: str, ep_row: pd.Series,
     return fig
 
 
+def build_range_breakout_chart(
+    hist: pd.DataFrame,
+    symbol: str,
+    ep_row: pd.Series,
+    period: str = "1y",
+    **kwargs,
+) -> go.Figure:
+    hist = _trim_hist(hist, period)
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        vertical_spacing=0.03, row_heights=[0.75, 0.25],
+    )
+    fig.add_trace(go.Candlestick(
+        x=hist.index, open=hist["Open"], high=hist["High"],
+        low=hist["Low"], close=hist["Close"], name=symbol,
+    ), row=1, col=1)
+
+    # Monthly pivot step line
+    monthly = hist.copy()
+    monthly["_ym"] = monthly.index.to_period("M")
+    mdf = monthly.groupby("_ym").agg(
+        H=("High", "max"), L=("Low", "min"), C=("Close", "last")
+    )
+    mdf["P"] = (mdf["H"] + mdf["L"] + mdf["C"]) / 3
+    mdf["P_applied"] = mdf["P"].shift(1)
+    mdf = mdf.dropna(subset=["P_applied"])
+    daily_pivot = hist.copy()
+    daily_pivot["_ym"] = daily_pivot.index.to_period("M")
+    daily_pivot = daily_pivot.merge(
+        mdf[["P_applied"]].rename(columns={"P_applied": "_pivot"}),
+        left_on="_ym", right_index=True, how="left"
+    )
+    fig.add_trace(go.Scatter(
+        x=daily_pivot.index, y=daily_pivot["_pivot"],
+        mode="lines", line=dict(color="#00BCD4", width=1.5),
+        name="Monthly Pivot", line_shape="hv",
+    ), row=1, col=1)
+
+    # Leg levels
+    leg1_high = ep_row.get("leg1_high")
+    leg2_low_pivot = ep_row.get("leg2_low_pivot")
+    leg2_low_price = ep_row.get("leg2_low_price")
+
+    if pd.notna(leg1_high):
+        fig.add_hline(y=leg1_high, line_dash="dash", line_color="#2E7D32",
+                      annotation_text="Leg1 High", row=1, col=1)
+    if pd.notna(leg2_low_pivot):
+        fig.add_hline(y=leg2_low_pivot, line_dash="dash", line_color="#C62828",
+                      annotation_text="Leg2 Low Pivot", row=1, col=1)
+    if pd.notna(leg2_low_price):
+        fig.add_hline(y=leg2_low_price, line_dash="dot", line_color="#C62828",
+                      annotation_text="Leg2 Low Price", row=1, col=1)
+
+    # Leg shading
+    leg_colors = ["rgba(46,125,50,0.08)", "rgba(198,40,40,0.08)",
+                  "rgba(46,125,50,0.08)", "rgba(198,40,40,0.08)",
+                  "rgba(46,125,50,0.08)"]
+    leg_starts = ["leg1_start", "leg2_start", "leg3_start", "leg4_start", "leg5_start"]
+    leg_ends = ["leg1_end", "leg2_end", "leg3_end", "leg4_end", "leg5_end"]
+    for i, (s_col, e_col, color) in enumerate(zip(leg_starts, leg_ends, leg_colors)):
+        s = ep_row.get(s_col)
+        e = ep_row.get(e_col)
+        if pd.notna(s) and pd.notna(e):
+            s_str = pd.Timestamp(s).strftime("%Y-%m-%d")
+            e_str = pd.Timestamp(e).strftime("%Y-%m-%d")
+            fig.add_vrect(x0=s_str, x1=e_str, fillcolor=color, line_width=0,
+                          annotation_text=f"Leg {i+1}", row=1, col=1)
+    # Volume
+    if "Volume" in hist.columns:
+        colors = ["green" if hist["Close"].iloc[i] >= hist["Open"].iloc[i] else "red"
+                  for i in range(len(hist))]
+        fig.add_trace(go.Bar(x=hist.index, y=hist["Volume"], marker_color=colors,
+                             showlegend=False), row=2, col=1)
+
+    fig.update_layout(
+        title=f"{symbol} — Range Breakout (5-Leg)",
+        xaxis_rangeslider_visible=False,
+        height=650, template="plotly_white",
+    )
+    return fig
 
 def build_supertrend_chart(hist: pd.DataFrame, symbol: str, ep_row: pd.Series,
                             period: str, st_period: int = 7, st_multiplier: float = 3.0) -> go.Figure:
@@ -1567,6 +1689,28 @@ def load_ema_pullback_ledger():
 @st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL)
 def load_supertrend_ledger():
     return levels_store.get_supertrend_episodes()
+
+
+@st.cache_data(show_spinner=False, ttl=DATA_CACHE_TTL)
+def load_range_breakout_ledger(status: str = None, pattern_type: str = None) -> pd.DataFrame:
+    df = levels_store.get_range_breakout_episodes(status=status, pattern_type=pattern_type)
+    if df.empty:
+        return df
+    for col in ["leg1_start", "leg1_end", "leg2_start", "leg2_end",
+                "leg3_start", "leg3_end", "leg4_start", "leg4_end",
+                "leg5_start", "leg5_end", "first_seen_at", "last_checked_at"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ["leg1_high", "leg2_low_pivot", "leg2_low_price",
+                "leg3_max_pivot", "leg4_min_pivot", "leg4_min_low",
+                "leg5_last_pivot", "leg5_max_pivot"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "breakout_confirmed" in df.columns:
+        df["breakout_confirmed"] = df["breakout_confirmed"].astype(bool)
+    if "is_ongoing" in df.columns:
+        df["is_ongoing"] = df["is_ongoing"].astype(bool)
+    return df
 
 
 @st.cache_data(show_spinner=False, ttl=3600 * 6)   # 6-hour cache — fundamentals change slowly

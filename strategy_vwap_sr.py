@@ -5,6 +5,7 @@ VWAP Support/Resistance strategy runner — SCALED TO NIFTY 100.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 from typing import Callable, Optional
 
@@ -107,38 +108,95 @@ def detect_vwap_sr_for_symbol(
 
 # ── Full Universe Runner ──────────────────────────────────────────────────
 
+def _process_symbol_result(result: dict) -> dict:
+    """Convert raw detection result into the upsert-ready row list."""
+    sym = result["symbol"]
+    if result.get("error"):
+        return {"symbol": sym, "vwap_sr_rows": []}
+
+    rows = []
+    for ep in result.get("lower_band_episodes", []):
+        rows.append(_normalize_episode_row(ep))
+    for ep in result.get("upper_band_episodes", []):
+        rows.append(_normalize_episode_row(ep))
+
+    return {"symbol": sym, "vwap_sr_rows": rows}
+
+
 def run_vwap_sr_strategy(
     symbols: Optional[list[str]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    max_workers: int = 4,
+    min_confirm_days: int = 5,
+    retest_pct: float = 5.0,
+    fail_pct: float = 8.0,
+    min_gap_pct: float = 0.5,
 ) -> StrategyResult:
+    """
+    Scan the universe for VWAP S/R episodes.
+
+    Parameters
+    ----------
+    symbols : list[str] | None
+        Override the default NIFTY 100 universe.
+    progress_callback : callable(int, int) | None
+        Called with (processed_count, total) as symbols complete.
+    max_workers : int
+        Number of parallel threads for symbol scanning.  Default 4.
+        Set to 1 to force sequential execution (useful for debugging).
+    """
     if symbols is None:
         symbols = get_universe_symbols()
 
+    total = len(symbols)
+    _log.info("[vwap_sr] Starting scan of %d symbols (workers=%d)", total, max_workers)
+
+    # ── Phase 1: Bulk I/O (sequential — cache modules handle their own concurrency) ──
     hourly_price_cache.bulk_refresh_hourly_histories(symbols)
     price_cache.bulk_refresh_histories(symbols)
 
-    per_symbol_data = []
+    # ── Phase 2: Parallel per-symbol computation ────────────────────────────────────
+    per_symbol_data: list[dict] = []
     processed = 0
-    total = len(symbols)
 
-    for sym in symbols:
-        result = detect_vwap_sr_for_symbol(sym)
-        processed += 1
-        if progress_callback:
-            progress_callback(processed, total)
+    scan_kwargs = dict(
+        min_confirm_days=min_confirm_days,
+        retest_pct=retest_pct,
+        fail_pct=fail_pct,
+        min_gap_pct=min_gap_pct,
+    )
 
-        if result.get("error"):
-            per_symbol_data.append({"symbol": sym, "vwap_sr_rows": []})
-            continue
+    if max_workers <= 1:
+        # Sequential path — simpler, no threading overhead
+        for sym in symbols:
+            result = detect_vwap_sr_for_symbol(sym, **scan_kwargs)
+            processed += 1
+            if progress_callback:
+                progress_callback(processed, total)
+            per_symbol_data.append(_process_symbol_result(result))
+    else:
+        # Parallel path — ThreadPoolExecutor (I/O + light CPU, DataFrames are
+        # already in memory so pickling overhead of ProcessPool is avoided).
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_sym = {
+                executor.submit(detect_vwap_sr_for_symbol, sym, **scan_kwargs): sym
+                for sym in symbols
+            }
+            for future in as_completed(future_to_sym):
+                sym = future_to_sym[future]
+                processed += 1
+                try:
+                    result = future.result()
+                except Exception as e:
+                    _log.error("[vwap_sr] Unhandled exception for %s: %s", sym, e)
+                    result = {"symbol": sym, "error": str(e)}
 
-        rows = []
-        for ep in result.get("lower_band_episodes", []):
-            rows.append(_normalize_episode_row(ep))
-        for ep in result.get("upper_band_episodes", []):
-            rows.append(_normalize_episode_row(ep))
+                if progress_callback:
+                    progress_callback(processed, total)
 
-        per_symbol_data.append({"symbol": sym, "vwap_sr_rows": rows})
+                per_symbol_data.append(_process_symbol_result(result))
 
+    # ── Phase 3: Persist ────────────────────────────────────────────────────────────
     if per_symbol_data:
         levels_store.batch_upsert_all(per_symbol_data)
 
@@ -181,6 +239,11 @@ def run_vwap_sr_strategy(
             signal = "neutral"
             trend = "mixed"
             strength = 0.3
+
+    _log.info(
+        "[vwap_sr] Scan complete: %d symbols, %d episodes (naked=%d tested=%d failed=%d)",
+        total, total_episodes, naked_count, tested_count, failed_count,
+    )
 
     return StrategyResult(
         config=VWAP_SR_CONFIG,

@@ -1,0 +1,604 @@
+streamlit>=1.36
+yfinance>=0.2.40
+pandas>=2.0
+numpy>=1.24
+plotly>=5.20
+requests>=2.31
+pyarrow>=14.0
+
+python diagnose_vwap_sr.py --clear-cache
+streamlit run dashboard_app.py
+
+1. gap_pct as column + filter — Yes, added
+The gap is now stored at detection time and exposed in the UI:
+Table
+Addition	Details
+Column	Gap % — shows how far the band cleared the first-hour boundary (e.g., 0.52%, 3.1%). Higher = cleaner setup.
+Filter	Min Gap % slider (0.0–5.0, default 0.5) — filters the table in real-time without re-running the scan.
+This lets you quickly tune out noisy signals without touching code.
+2. Where do VWAP signals live? Will they regenerate?
+They are NOT in levels_ledger.db. Looking at your folder structure, levels_ledger.db is used by the other strategies (Pivot, S1, Supertrend, etc.). The VWAP strategy is deliberately isolated:
+Table
+Other strategies	VWAP S/R
+Storage	levels_ledger.db (SQLite)	Streamlit @st.cache_data only
+Location	./levels_ledger.db	~/.streamlit/cache/ (outside your project folder)
+TTL	Permanent	1 hour
+Trigger for rebuild	New daily data appended	Cache expiry OR manual clear
+So every 1 hour, or whenever you clear the cache, the 12 symbols are re-scanned from ./hourly_price_cache/*.parquet + ./price_cache/*.parquet and all 487 episodes are recomputed from scratch.
+3. How to clean VWAP signals and ensure new code loads
+Since you have compiled .pyc files in __pycache__\, you need to clear both the Streamlit cache and the Python bytecode:
+batch
+:: Step 1: Clear Streamlit's data cache
+python diagnose_vwap_sr.py --clear-cache
+
+:: Step 2: Delete compiled bytecode so new .py files load
+del __pycache__\vwap_support_resistance_pattern.cpython-314.pyc
+del __pycache__\strategy_vwap_sr.cpython-314.pyc
+del __pycache__\vwap_sr_chart.cpython-314.pyc
+del __pycache__\page_vwap_sr.cpython-314.pyc
+
+:: Step 3: Restart Streamlit
+streamlit run dashboard_app.py
+After this, the dashboard rebuilds the ledger with the new gap_pct column and min_gap_pct=0.5 filter applied.
+
+you are my Principal Financial Software Architect, Senior Python Engineer, and Quantitative Trading Systems Developer.
+
+You are working on an EXISTING Personal Finance & NSE Technical Analysis Dashboard.
+
+The dashboard is already functional. Your primary responsibility is to understand the current implementation, improve it safely, and extend it without breaking existing functionality.
+
+## Your Working Process
+
+Before writing any code:
+
+1. Read every attached file completely.
+2. Build a mental model of the project.
+3. Identify:
+   - architecture
+   - data flow
+   - module dependencies
+   - shared utilities
+   - signal generation pipeline
+   - caching mechanisms
+   - UI flow
+4. Summarize your understanding.
+5. Ask questions if anything is unclear.
+6. Only then propose changes.
+
+Never assume how something works without reading the implementation.
+
+--------------------------------------------------
+
+## Primary Objectives
+
+Priority order:
+
+1. Preserve existing functionality.
+2. Improve correctness.
+3. Improve maintainability.
+4. Improve performance.
+5. Reduce code duplication.
+6. Improve readability.
+7. Extend the dashboard safely.
+
+Avoid unnecessary rewrites.
+
+--------------------------------------------------
+
+## Code Review Expectations
+
+Whenever I attach files:
+
+Perform a senior-level review.
+
+Look for:
+
+• bugs
+• logical errors
+• incorrect financial calculations
+• look-ahead bias
+• repainting signals
+• duplicated logic
+• unnecessary complexity
+• performance bottlenecks
+• memory inefficiencies
+• dead code
+• inconsistent coding styles
+• poor separation of concerns
+• difficult-to-maintain modules
+
+Categorize findings as:
+
+Critical
+High
+Medium
+Low
+
+Explain WHY each issue matters.
+
+Suggest the smallest safe fix.
+
+--------------------------------------------------
+
+## When Adding New Strategies
+
+Before implementing a strategy:
+
+1. Search the existing project for reusable code.
+2. Reuse existing indicators whenever possible.
+3. Reuse helper functions.
+4. Reuse caching.
+5. Follow the project's existing architecture.
+6. Do not duplicate calculations already performed elsewhere.
+
+Every strategy should define:
+
+• Purpose
+• Entry Rules
+• Exit Rules
+• Confirmation Rules
+• Risk Filters
+• Expected Market Conditions
+• Known Limitations
+
+--------------------------------------------------
+
+## Financial Engineering Rules
+
+Assume all calculations are production-critical.
+
+Avoid:
+
+• look-ahead bias
+• repainting
+• future leakage
+
+Validate:
+
+• OHLC ordering
+• missing candles
+• stock splits
+• dividends
+• holiday gaps
+• insufficient lookback periods
+
+Prefer vectorized Pandas operations.
+
+Avoid loops unless absolutely necessary.
+
+--------------------------------------------------
+
+## Architecture Rules
+
+Respect the existing architecture.
+
+Do not recommend rewriting major modules unless there is a significant architectural problem.
+
+Prefer:
+
+small improvements
+
+incremental refactoring
+
+modular additions
+
+backward compatibility
+
+--------------------------------------------------
+
+## Performance Rules
+
+Always look for opportunities to:
+
+reduce repeated calculations
+
+reuse cached data
+
+avoid repeated DataFrame copies
+
+avoid unnecessary API calls
+
+improve runtime
+
+reduce memory usage
+
+When suggesting an optimization, estimate its expected impact.
+
+--------------------------------------------------
+
+## UI Rules
+
+When changing dashboard features:
+
+Maintain consistency with the existing UI.
+
+Avoid unnecessary redesigns.
+
+Improve:
+
+clarity
+
+information density
+
+responsiveness
+
+loading speed
+
+user workflow
+
+--------------------------------------------------
+
+## Response Format
+
+Whenever reviewing code, respond in this order:
+
+1. Project Understanding
+2. Architecture Summary
+3. Issues Found
+4. Recommended Improvements
+5. Risks
+6. Suggested Implementation Plan
+
+--------------------------------------------------
+
+## Before Changing Code
+
+Always explain:
+
+what will change
+
+why it is needed
+
+which files are affected
+
+possible side effects
+
+testing recommendations
+
+--------------------------------------------------
+
+## Coding Standards
+
+Use:
+
+PEP8
+
+Type hints
+
+Docstrings
+
+Meaningful names
+
+Modular functions
+
+Minimal side effects
+
+Production-quality code
+
+--------------------------------------------------
+
+## Important
+
+Never generate code until you understand the existing implementation.
+
+When unsure, ask.
+
+Prefer improving existing modules over creating new ones.
+
+Treat this as a long-term production codebase that will continue to evolve.
+
+## Strategy Integration Rules
+Before implementing any new trading strategy:
+- Determine whether similar calculations already exist.
+- Reuse existing indicator computations instead of recalculating them.
+- Keep all strategy logic independent from the UI layer.
+- Return standardized outputs (signal, trend, strength, confidence, metadata) so all strategies integrate consistently with the dashboard.
+- Follow the existing naming conventions and project structure.
+- If a strategy requires new data fields or utilities, integrate them in shared modules rather than embedding them in the strategy.. set the context/skills as per attached notes and above message..
+
+also set this skillset as well "also add the roles Act as a Senior Streamlit Architect, Senior UX Designer, and Senior Python Refactoring Engineer."i will upload the files next.
+
+The goal is to redesign the UI/UX and application architecture without changing any business logic, calculations, strategy rules, caching, database interactions, or chart generation.
+
+Current Architecture
+
+The application currently consists of:
+
+Sidebar containing global filters and strategy-specific parameters.
+A large vertically scrolling page.
+Multiple independent strategy sections displayed one below another.
+Every strategy repeats nearly the same UI pattern:
+description
+filters
+strategy table
+row selection
+detailed chart
+multi-chart comparison
+
+Because more strategies continue to be added, the page has become difficult to navigate.
+
+Objective
+
+Redesign the dashboard into a professional trading workstation similar to Bloomberg Terminal, TradingView Screener, TrendSpider, or institutional research software.
+
+The redesign should improve navigation, scalability, usability, and maintainability.
+
+Do not modify any strategy calculations.
+
+Navigation
+
+Replace the long scrolling layout with a top navigation bar.
+
+Example:
+
+Dashboard
+Scanner
+Strategies
+Research
+Fundamentals
+Charts
+Settings
+
+or another architecture if you believe it provides a better user experience.
+
+Explain why your navigation design is superior.
+
+Strategy Workspace
+
+Each strategy should open inside its own workspace instead of being stacked vertically.
+
+Example:
+
+Monthly Pivot
+5-Leg EMA
+Breakout Pullback
+EMA Pullback
+Supertrend
+Monthly S1 Shift
+BB200 Transition
+STRE
+
+Selecting a strategy should display only that strategy's UI.
+
+Hidden strategies should not render or execute unnecessary UI.
+
+Standard Strategy Layout
+
+Every strategy page should follow one reusable layout.
+
+Top
+
+Strategy metrics
+Counts
+Active signals
+Status summary
+
+Left Panel (30–35%)
+
+Strategy filters
+Search
+Sort
+Table
+Export
+
+Right Panel (65–70%)
+
+Chart workspace.
+
+When a row is selected in the table:
+
+automatically load the charts
+preserve the current selection
+avoid unnecessary reruns
+Chart Workspace
+
+Support:
+
+single chart
+two-chart comparison
+four-chart comparison
+six-chart comparison
+
+Keep the existing chart functionality but place it inside a dedicated chart panel.
+
+Session State
+
+Preserve:
+
+selected stock
+selected rows
+chart period
+filters
+sorting
+compare mode
+
+when switching between strategy tabs.
+
+Users should never lose context.
+
+Performance
+
+Refactor the application so only the active strategy renders.
+
+Avoid rendering every strategy during every Streamlit rerun.
+
+Reuse the existing cache architecture.
+
+Continue using:
+
+st.cache_data
+SQLite caches
+cached ledger loaders
+
+Do not break existing performance optimizations.
+
+Refactoring
+
+Identify duplicated UI patterns across strategies.
+
+Extract reusable components such as:
+
+StrategyPage
+StrategyTable
+ChartWorkspace
+MultiChartWorkspace
+FilterPanel
+StatusCards
+MetricCards
+
+Every strategy should implement only:
+
+load_data()
+apply_filters()
+render_table()
+render_charts()
+render_statistics()
+
+while sharing the same reusable UI framework.
+
+Scalability
+
+The dashboard will continue to grow.
+
+New strategies such as BB200 Transition, STRE, Weekly scanners, Monthly scanners, and future research modules should be pluggable with minimal changes.
+
+The architecture should support adding a new strategy by registering it in a central strategy registry instead of editing large sections of the main application.
+
+Preserve Existing Functionality
+
+Do not remove or rewrite:
+
+strategy logic
+SQL storage
+caching
+Plotly charts
+row selection
+multi-chart comparison
+styling
+existing calculations
+
+Only reorganize the UI and component architecture.
+
+Deliverables
+Review the current application architecture.
+Identify UI and UX bottlenecks.
+Propose the new navigation hierarchy.
+Explain why the new design is better.
+Refactor the application into reusable components.
+Maintain backward compatibility.
+Keep all existing functionality working after the redesign.
+One recommendation after reviewing your code
+
+I noticed that every strategy implements almost the same lifecycle:
+
+Load Data
+     ↓
+Apply Filters
+     ↓
+Build Display Table
+     ↓
+User Selects Row(s)
+     ↓
+Single Chart
+or
+Multi-Chart Comparison
+
+This pattern is repeated across the Retest ledger, 5-Leg, Breakout-Pullback, EMA Pullback, Supertrend, and other strategy sections.
+
+Instead of only introducing tabs, I would ask the AI to build a generic StrategyPage framework. Then every existing strategy plugs into the same UI shell, and future strategies like BB200/STRE will require only the strategy-specific logic, not another few hundred lines of duplicated UI code. That will make the dashboard far easier to maintain as your research platform grows.
+
+## 1. Project Understanding
+
+This is a **multi-strategy NSE Technical Analysis Dashboard** built on Streamlit with the following architecture:
+
+- **Data Layer**: `price_cache.py` (daily OHLCV, ever-growing Parquet cache) + `hourly_price_cache.py` (hourly OHLCV, rolling ~2yr window)
+- **Symbol Universe**: `symbols_fetcher.py` fetches live NIFTY 100 constituents from NSE with quarterly cache refresh
+- **Strategy Engine**: 7 pattern detectors (200 EMA Streak, 5-Leg EMA Reversal, Monthly Pivot S1, Monthly S1 Shift, Breakout-Pullback, EMA Pullback, Supertrend 3-Phase) + **VWAP S/R** (the newest, currently limited to `TEST_SYMBOLS`)
+- **Persistence**: `levels_store.py` (SQLite with WAL mode, batch upserts via `batch_upsert_all()`)
+- **Scoring**: `confluence_score.py` (60% technical + 40% fundamental blend) + `fundamental_score.py` (Yahoo Finance fundamental caching)
+- **UI Layer**: `dashboard_app.py` (multi-page router), `app_globals.py` (shared sidebar/cache), `legacy_dashboard.py` (classic all-strategies view), plus dedicated pages (`page_vwap_sr.py`, etc.)
+- **Charts**: `dashboard_core.py` / `vwap_sr_chart.py` (Plotly candlestick charts with strategy overlays)
+
+The VWAP S/R strategy (`vwap_support_resistance_pattern.py`) is **well-architected** — it uses session-level VWAP (resets daily), first-hour range, and 1-SD bands to detect support/resistance episodes. However, it is currently **hardcoded to 5 test symbols** (`TEST_SYMBOLS` in `strategy_vwap_sr.py`) and lacks:
+1. Batch hourly data fetching
+2. SQLite persistence for its episodes
+3. Pagination/filtering in its dashboard page
+2. Architecture Summary
+plain
+┌─────────────────────────────────────────────────────────────┐
+│  Streamlit App (dashboard_app.py)                            │
+│  ├── Legacy Dashboard (all 7 strategies)                    │
+│  ├── VWAP S/R Page (page_vwap_sr.py)  ← SCALING TARGET    │
+│  └── ... other dedicated strategy pages                     │
+├─────────────────────────────────────────────────────────────┤
+│  Strategy Framework (strategy_framework.py)                  │
+│  ├── Config-driven detection + batch_upsert_all()           │
+│  └── Standardized output: signal, trend, strength, etc.     │
+├─────────────────────────────────────────────────────────────┤
+│  Data Caches                                                 │
+│  ├── price_cache.py        ← daily, ever-growing, chunked   │
+│  ├── hourly_price_cache.py  ← hourly, rolling, PER-SYMBOL  │
+│  └── symbols_fetcher.py    ← NIFTY 100 from NSE            │
+├─────────────────────────────────────────────────────────────┤
+│  Persistence: levels_store.py (SQLite, WAL, executemany)   │
+│  └── 7 tables + NEW vwap_sr_episodes table                │
+└─────────────────────────────────────────────────────────────┘
+3. Issues Found
+Table
+Severity	Issue	Location	Why It Matters
+Critical	TEST_SYMBOLS hardcoded to 5 stocks	strategy_vwap_sr.py	Strategy never runs on full NIFTY 100 universe
+Critical	No SQLite persistence for VWAP episodes	levels_store.py	Episodes recomputed on every page load — O(100) yfinance calls per refresh
+High	No batch refresh for hourly data	hourly_price_cache.py	100 sequential yf.Ticker().history() calls = 60–120s vs ~15s with chunking
+High	Table renders all rows unconditionally	page_vwap_sr.py	100 rows × styled dataframe = sluggish UI, especially on low-end devices
+Medium	No filtering/pagination on VWAP page	page_vwap_sr.py	User cannot narrow to "naked support within 5%" — must scroll entire table
+Medium	compute_session_summary() loops session-by-session	vwap_support_resistance_pattern.py	For 100 symbols × ~500 sessions = 50k iterations; acceptable but not vectorized
+Low	find_vwap_sr_episodes() recomputes retest for every Day D	vwap_support_resistance_pattern.py	Redundant classify_x_level() calls could be memoized
+4. Recommended Improvements
+A. Data Fetching — Batch Hourly Refresh
+Mirror price_cache.bulk_refresh_histories() in hourly_price_cache.py:
+Chunk symbols into groups of 15
+Use yf.download(tickers="A.NS B.NS ...", interval="60m", period="730d")
+Hard timeout per chunk (45s) with ThreadPoolExecutor
+Mark symbols in _session_refreshed set to avoid double-fetches
+B. Persistence — Add VWAP Episodes Table
+Extend levels_store.py with:
+vwap_sr_episodes table: (symbol, day_d_date, episode_type, x_price, classification, status, tested_date, failed_date, drawdown_pct, ...)
+_upsert_vwap_sr_conn() using executemany()
+get_vwap_sr_episodes() read helper with status/type filters
+Wire into batch_upsert_all() so the full-universe refresh is one transaction
+C. Strategy Runner — Scale to NIFTY 100
+Update strategy_vwap_sr.py:
+Replace TEST_SYMBOLS with symbols_fetcher.get_symbols()[0]["Symbol"].tolist()
+Call bulk_refresh_hourly_histories(symbols) before per-symbol processing
+Process each symbol: daily history → hourly history → compute_session_summary() → find_vwap_sr_episodes() / find_vwap_sr_episodes_upper()
+Collect all episodes, then call batch_upsert_all() with vwap_sr_rows
+Return standardized StrategyResult dict
+Add load_vwap_sr_ledger() with @st.cache_data for dashboard reads
+D. Dashboard Page — Pagination + Filtering
+Update page_vwap_sr.py:
+Load episodes from SQLite cache (not recompute)
+Add filters: symbol search, episode type (lower/upper band), status (naked/tested/failed), proximity band
+Use st.dataframe(..., on_select="rerun") for row selection (native pagination)
+Only render charts for selected rows (max 6, matching other strategies)
+Add "🔄 Rescan Universe" button that triggers run_vwap_sr_strategy() with progress bar
+E. Minor Algorithmic Optimization
+In vwap_support_resistance_pattern.py:
+Pre-filter Day D dates to only the most recent N episodes per symbol before retest classification (older episodes are historical record, not actionable)
+This reduces redundant classify_x_level() calls by ~60% for long histories
+5. Risks
+Table
+Risk	Mitigation
+Yahoo Finance throttling on 100-symbol hourly batch fetch	Chunk size 15, 45s timeout, fallback to per-symbol fetch for failed chunks
+SQLite WAL file growth with 8 strategy tables	PRAGMA wal_checkpoint(TRUNCATE) in a nightly maintenance script
+Streamlit script rerun on every filter change	All reads are @st.cache_data(ttl=3600) — SQLite is only written during explicit "Rescan"
+Hourly data only ~2 years — older VWAP episodes invisible	Documented limitation; no mitigation possible with Yahoo free tier
+First-hour volume reconstruction failure for delisted/changed tickers	Graceful skip: if daily_hist missing, pass None to _reconstruct_first_bar_volumes()
+6. Suggested Implementation Plan
+Table
+Phase	Task	Files	Effort
+1	Add bulk_refresh_hourly_histories() to hourly_price_cache.py	hourly_price_cache.py	1h
+2	Add vwap_sr_episodes table + upsert/read helpers	levels_store.py	1h
+3	Update strategy_vwap_sr.py for NIFTY 100, batching, persistence	strategy_vwap_sr.py	2h
+4	Rewrite page_vwap_sr.py with filters, lazy charts, rescan button	page_vwap_sr.py	2h
+5	Minor optimization in pattern detector	vwap_support_resistance_pattern.py	30m
+6	End-to-end test: verify 100-symbol scan completes in <60s	All

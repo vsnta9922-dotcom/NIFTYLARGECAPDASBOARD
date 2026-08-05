@@ -28,6 +28,20 @@ upper-band episodes.
 KNOWN LIMITATION (disclosed, not a bug): hourly data is only ever a
 rolling ~2-year window (see hourly_price_cache.py), so Day D detection
 can only ever look as far back as that window.
+
+═══════════════════════════════════════════════════════════════════════════
+FIX (this revision) — 'tested' status firing without a genuine retest
+═══════════════════════════════════════════════════════════════════════════
+classify_x_level_resistance() previously marked episodes 'tested' the
+moment price ever came within retest_pct% of X, with no requirement that
+price first move away from X. Since X is often already close to price
+right when it's established, near-term levels got marked "tested" almost
+immediately from ordinary noise — reported in practice as e.g. an X level
+from 29-Jul showing "tested" within a day or two despite no real retest
+having happened. Fixed by requiring a confirmed move away from X FIRST
+(mirrors the equivalent fix in monthly_s1_shift_pattern.classify_x_level,
+which find_vwap_sr_episodes() below also depends on for lower-band
+episodes — both were affected, both are now fixed).
 """
 import logging
 import numpy as np
@@ -140,65 +154,132 @@ def compute_session_summary(hourly_df: pd.DataFrame, daily_hist: pd.DataFrame = 
 
 
 def classify_x_level_resistance(daily_hist: pd.DataFrame, x_price: float, day_d_date,
-                                  retest_pct: float = 5.0, fail_pct: float = 8.0) -> dict:
+                                  retest_pct: float = 5.0, fail_pct: float = 8.0,
+                                  min_confirm_days: int = 5) -> dict:
     """
-    Resistance mirror of classify_x_level.
+    Resistance mirror of classify_x_level (upper-band / ceiling logic).
 
     X is a ceiling established from above (upper-band Day D).
-    Favorable move for shorts = price drops below X.
-    - 'tested' : after dropping away, price rallies back to within
-                 retest_pct of X from below.
-    - 'failed' : price breaks above X by fail_pct.
-    - 'max_runup_pct' : max favorable drop below X (negative number).
+    Two-phase logic, symmetric to classify_x_level:
+
+      Phase 1 — Quiet window (first min_confirm_days trading days after
+                Day D).  If price touches X from below (High >= X) on ANY
+                of these days the level was not respected — episode is
+                invalidated (returned as 'naked' with days_tracked=0 so
+                callers can filter it out).  A fail_pct breach upward
+                (High >= fail_threshold) → 'failed' immediately, even
+                inside the window.
+
+      Phase 2 — After the window: a single day where High >= X → 'tested'.
+                A fail_pct breach (High >= X * (1 + fail_pct/100)) at any
+                point → 'failed'.  Ties go to 'failed'.
+
+      'max_runup_pct' : max favorable drop below X (negative = good for a
+                        resistance short), capped ±1000%.
     """
-    # Normalize dates to midnight to avoid timezone/time-of-day mismatches.
+    # Normalize to midnight to avoid tz / timestamp mismatches.
     day_d_norm = pd.Timestamp(day_d_date).normalize()
     after = daily_hist.loc[daily_hist.index.normalize() > day_d_norm]
-    if after.empty:
+    if after.empty or pd.isna(x_price):
         return {"status": "naked", "tested_date": None, "tested_price": None,
                 "failed_date": None, "failed_price": None,
                 "max_runup_pct": None, "days_tracked": 0}
 
-    pct_series = (after["Close"] - x_price) / x_price * 100
-    max_favorable = float(pct_series.min()) if not pct_series.empty else None
-    # Sanity cap: for large-cap NSE stocks, a >50% move in the tracking
-    # window is almost always a data artefact (split, bad tick, or date
-    # misalignment).  Resistance run-up is negative (price drop below X).
-    if max_favorable is not None:
-        max_favorable = max(-50.0, min(50.0, max_favorable))
+    dates = after.index
+    highs = after["High"].to_numpy()
+    lows = after["Low"].to_numpy()
+    closes = after["Close"].to_numpy()
+    n = len(dates)
 
-    tested_date = None
-    tested_price = None
-    if max_favorable is not None and max_favorable < 0:
-        best_idx = pct_series.idxmin()
-        post_best = after.loc[after.index > best_idx]
-        if not post_best.empty:
-            retest_threshold = x_price * (1 - retest_pct / 100)
-            retest_mask = post_best["Close"] >= retest_threshold
-            if retest_mask.any():
-                tested_date = retest_mask.index[0]
-                tested_price = float(post_best.loc[tested_date, "Close"])
+    fail_threshold = x_price * (1 + fail_pct / 100.0)
+    running_low = np.minimum.accumulate(lows)
 
-    fail_threshold = x_price * (1 + fail_pct / 100)
-    fail_mask = after["Close"] >= fail_threshold
-    failed_date = fail_mask.index[0] if fail_mask.any() else None
-    failed_price = float(after.loc[failed_date, "Close"]) if failed_date is not None else None
+    # ── Phase 1: quiet window ─────────────────────────────────────────────
+    quiet_end = min(min_confirm_days, n)
 
-    if failed_date is not None:
-        status = "failed"
-    elif tested_date is not None:
-        status = "tested"
-    else:
-        status = "naked"
+    for i in range(quiet_end):
+        if highs[i] >= fail_threshold:
+            # Failure (upside break) inside the quiet window.
+            days_tracked = int((dates[i] - day_d_norm).days)
+            max_runup_pct = float((running_low[: i + 1].min() - x_price) / x_price * 100)
+            max_runup_pct = max(-1000.0, min(1000.0, max_runup_pct))
+            return {
+                "status": "failed",
+                "tested_date": None,
+                "tested_price": None,
+                "failed_date": dates[i],
+                "failed_price": float(closes[i]),
+                "max_runup_pct": max_runup_pct,
+                "days_tracked": days_tracked,
+            }
+        if highs[i] >= x_price:
+            # Touch inside the quiet window — level not respected.
+            # Mark as invalidated so callers can skip this episode entirely.
+            return {
+                "status": "naked", "invalidated": True,
+                "tested_date": None, "tested_price": None,
+                "failed_date": None, "failed_price": None,
+                "max_runup_pct": None,
+                "days_tracked": int((dates[i] - day_d_norm).days),
+            }
 
+    # Still inside window with no data beyond it — stay naked.
+    if n <= quiet_end:
+        max_runup_pct = float((running_low.min() - x_price) / x_price * 100)
+        max_runup_pct = max(-1000.0, min(1000.0, max_runup_pct))
+        days_tracked = int((dates[-1] - day_d_norm).days)
+        return {
+            "status": "naked", "tested_date": None, "tested_price": None,
+            "failed_date": None, "failed_price": None,
+            "max_runup_pct": max_runup_pct, "days_tracked": days_tracked,
+        }
+
+    # ── Phase 2: post-window tracking ────────────────────────────────────
+    # First High >= X → 'tested'.  First High >= fail_threshold → 'failed'.
+    tested_pos = None
+    fail_pos = None
+
+    for i in range(quiet_end, n):
+        if highs[i] >= fail_threshold and fail_pos is None:
+            fail_pos = i
+        if highs[i] >= x_price and tested_pos is None:
+            tested_pos = i
+        if fail_pos is not None and (tested_pos is None or fail_pos <= tested_pos):
+            break
+        if fail_pos is not None and tested_pos is not None:
+            break
+
+    candidates = []
+    if fail_pos is not None:
+        candidates.append(("failed", fail_pos))
+    if tested_pos is not None:
+        candidates.append(("tested", tested_pos))
+
+    if candidates:
+        candidates.sort(key=lambda c: (c[1], c[0] != "failed"))
+        status, pos = candidates[0]
+        event_date = dates[pos]
+        event_price = float(closes[pos])
+        days_tracked = int((event_date - day_d_norm).days)
+        max_runup_pct = float((running_low[: pos + 1].min() - x_price) / x_price * 100)
+        max_runup_pct = max(-1000.0, min(1000.0, max_runup_pct))
+        return {
+            "status": status,
+            "tested_date": event_date if status == "tested" else None,
+            "tested_price": event_price if status == "tested" else None,
+            "failed_date": event_date if status == "failed" else None,
+            "failed_price": event_price if status == "failed" else None,
+            "max_runup_pct": max_runup_pct,
+            "days_tracked": days_tracked,
+        }
+
+    max_runup_pct = float((running_low.min() - x_price) / x_price * 100)
+    max_runup_pct = max(-1000.0, min(1000.0, max_runup_pct))
+    days_tracked = int((dates[-1] - day_d_norm).days)
     return {
-        "status": status,
-        "tested_date": tested_date,
-        "tested_price": tested_price,
-        "failed_date": failed_date,
-        "failed_price": failed_price,
-        "max_runup_pct": max_favorable,
-        "days_tracked": len(after),
+        "status": "naked", "tested_date": None, "tested_price": None,
+        "failed_date": None, "failed_price": None,
+        "max_runup_pct": max_runup_pct, "days_tracked": days_tracked,
     }
 
 
@@ -279,7 +360,13 @@ def find_vwap_sr_episodes(daily_hist: pd.DataFrame, session_summary: pd.DataFram
         classification_changed_date = day_d_date
 
         retest = classify_x_level(daily_hist, x_price, day_d_date,
-                                  retest_pct=retest_pct, fail_pct=fail_pct)
+                                  retest_pct=retest_pct, fail_pct=fail_pct,
+                                  min_confirm_days=min_confirm_days)
+
+        # Episode invalidated: price touched X inside the quiet window.
+        # The level was never genuinely established — skip it entirely.
+        if retest.get("invalidated"):
+            continue
 
         if min_runup_pct is not None and retest.get("max_runup_pct") is not None:
             if retest["max_runup_pct"] < min_runup_pct:
@@ -357,7 +444,12 @@ def find_vwap_sr_episodes_upper(daily_hist: pd.DataFrame, session_summary: pd.Da
         classification_changed_date = day_d_date
 
         retest = classify_x_level_resistance(daily_hist, x_price, day_d_date,
-                                               retest_pct=retest_pct, fail_pct=fail_pct)
+                                               retest_pct=retest_pct, fail_pct=fail_pct,
+                                               min_confirm_days=min_confirm_days)
+
+        # Episode invalidated: price touched X inside the quiet window.
+        if retest.get("invalidated"):
+            continue
 
         if min_runup_pct is not None and retest.get("max_runup_pct") is not None:
             if retest["max_runup_pct"] > -min_runup_pct:

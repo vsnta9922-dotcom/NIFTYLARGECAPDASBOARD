@@ -62,10 +62,12 @@ def _connect(check_same_thread: bool = True) -> sqlite3.Connection:
         DB_PATH,
         check_same_thread=check_same_thread,
         detect_types=sqlite3.PARSE_DECLTYPES,
+        timeout=30.0,  
     )
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-32000")
+    conn.execute("PRAGMA busy_timeout=30000")
 
     if not _schema_ready:
         _run_migrations(conn)
@@ -391,6 +393,38 @@ def _run_migrations(conn: sqlite3.Connection):
         ("max_drawdown_pct", "REAL"),
     ])
 
+    # ── Range Breakout (5-Leg) Episodes Table ──────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS range_breakout_episodes (
+            symbol              TEXT    NOT NULL,
+            leg1_start          TEXT    NOT NULL,
+            leg1_end            TEXT,
+            leg2_start          TEXT,
+            leg2_end            TEXT,
+            leg3_start          TEXT,
+            leg3_end            TEXT,
+            leg4_start          TEXT,
+            leg4_end            TEXT,
+            leg5_start          TEXT,
+            leg5_end            TEXT,
+            leg1_high           REAL,
+            leg2_low_pivot      REAL,
+            leg2_low_price      REAL,
+            leg3_max_pivot      REAL,
+            leg4_min_pivot      REAL,
+            leg4_min_low        REAL,
+            leg5_last_pivot     REAL,
+            leg5_max_pivot      REAL,
+            status              TEXT,
+            pattern_type        TEXT,
+            breakout_confirmed  INTEGER,
+            is_ongoing          INTEGER,
+            first_seen_at       TEXT,
+            last_checked_at     TEXT,
+            PRIMARY KEY (symbol, leg1_start)
+        )
+    """)
+
     # Backfill total_streak_days for any rows where it is NULL (written by older
     # code versions that stored it inconsistently, or added via ALTER TABLE with
     # no default). Use calendar-day difference as a reliable approximation —
@@ -429,6 +463,9 @@ def _run_migrations(conn: sqlite3.Connection):
         ("idx_vwap_symbol",    "vwap_sr_episodes(symbol)"),
         ("idx_vwap_status",    "vwap_sr_episodes(status)"),
         ("idx_vwap_type",      "vwap_sr_episodes(episode_type)"),
+        ("idx_rb_symbol",      "range_breakout_episodes(symbol)"),
+        ("idx_rb_status",      "range_breakout_episodes(status)"),
+        ("idx_rb_type",        "range_breakout_episodes(pattern_type)"),
     ]
     for idx_name, idx_spec in _secondary_indexes:
         conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {idx_spec}")
@@ -485,6 +522,8 @@ def batch_upsert_all(per_symbol_data: list[dict]):
                 _upsert_supertrend_conn(conn, sym, item["supertrend_rows"], now)
             if item.get("vwap_sr_rows") is not None:
                 _upsert_vwap_sr_conn(conn, sym, item["vwap_sr_rows"], now)
+            if item.get("range_breakout_rows") is not None:
+                _upsert_range_breakout_conn(conn, sym, item["range_breakout_rows"], now)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -917,6 +956,83 @@ def _upsert_vwap_sr_conn(conn, symbol: str, rows: list, now: str):
         )
     else:
         conn.execute("DELETE FROM vwap_sr_episodes WHERE symbol=?", (symbol,))
+def _upsert_range_breakout_conn(conn, symbol: str, rows: list, now: str):
+    def _ts(v):
+        if v is None or (hasattr(v, '__class__') and v.__class__.__name__ in ('NaTType',)):
+            return None
+        try:
+            import pandas as pd
+            ts = pd.Timestamp(v)
+            return None if pd.isna(ts) else ts.strftime("%Y-%m-%d")
+        except Exception:
+            return str(v) if v else None
+
+    params = [
+        (
+            symbol, _ts(r["leg1_start"]), _ts(r.get("leg1_end")),
+            _ts(r.get("leg2_start")), _ts(r.get("leg2_end")),
+            _ts(r.get("leg3_start")), _ts(r.get("leg3_end")),
+            _ts(r.get("leg4_start")), _ts(r.get("leg4_end")),
+            _ts(r.get("leg5_start")), _ts(r.get("leg5_end")),
+            r.get("leg1_high"), r.get("leg2_low_pivot"), r.get("leg2_low_price"),
+            r.get("leg3_max_pivot"), r.get("leg4_min_pivot"), r.get("leg4_min_low"),
+            r.get("leg5_last_pivot"), r.get("leg5_max_pivot"),
+            r.get("status"), r.get("pattern_type"),
+            1 if r.get("breakout_confirmed") else 0,
+            1 if r.get("is_ongoing") else 0,
+            symbol, _ts(r["leg1_start"]), now,
+            now,
+        )
+        for r in rows
+    ]
+    conn.executemany(
+        """
+        INSERT INTO range_breakout_episodes
+            (symbol, leg1_start, leg1_end, leg2_start, leg2_end,
+             leg3_start, leg3_end, leg4_start, leg4_end,
+             leg5_start, leg5_end,
+             leg1_high, leg2_low_pivot, leg2_low_price,
+             leg3_max_pivot, leg4_min_pivot, leg4_min_low,
+             leg5_last_pivot, leg5_max_pivot,
+             status, pattern_type, breakout_confirmed, is_ongoing,
+             first_seen_at, last_checked_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+            COALESCE((SELECT first_seen_at FROM range_breakout_episodes
+                       WHERE symbol=? AND leg1_start=?), ?),
+            ?)
+        ON CONFLICT(symbol, leg1_start) DO UPDATE SET
+            leg1_end=excluded.leg1_end,
+            leg2_start=excluded.leg2_start, leg2_end=excluded.leg2_end,
+            leg3_start=excluded.leg3_start, leg3_end=excluded.leg3_end,
+            leg4_start=excluded.leg4_start, leg4_end=excluded.leg4_end,
+            leg5_start=excluded.leg5_start, leg5_end=excluded.leg5_end,
+            leg1_high=excluded.leg1_high,
+            leg2_low_pivot=excluded.leg2_low_pivot,
+            leg2_low_price=excluded.leg2_low_price,
+            leg3_max_pivot=excluded.leg3_max_pivot,
+            leg4_min_pivot=excluded.leg4_min_pivot,
+            leg4_min_low=excluded.leg4_min_low,
+            leg5_last_pivot=excluded.leg5_last_pivot,
+            leg5_max_pivot=excluded.leg5_max_pivot,
+            status=excluded.status,
+            pattern_type=excluded.pattern_type,
+            breakout_confirmed=excluded.breakout_confirmed,
+            is_ongoing=excluded.is_ongoing,
+            last_checked_at=excluded.last_checked_at
+        """,
+        params,
+    )
+    if rows:
+        keep_keys = [r["leg1_start"] for r in rows]
+        placeholders = ",".join("?" * len(keep_keys))
+        conn.execute(
+            f"DELETE FROM range_breakout_episodes WHERE symbol=? AND leg1_start NOT IN ({placeholders})",
+            [symbol, *keep_keys],
+        )
+    else:
+        conn.execute("DELETE FROM range_breakout_episodes WHERE symbol=?", (symbol,))
+
+
 # ---------------------------------------------------------------------------
 # Legacy per-symbol API — kept for backward compatibility (e.g. standalone
 # diagnostic scripts). Each creates/closes its own connection.
@@ -1179,6 +1295,25 @@ def get_vwap_sr_episodes(status: str = None, episode_type: str = None) -> pd.Dat
     if episode_type:
         conditions.append("episode_type = ?")
         params.append(episode_type)
+    if conditions:
+        q += " WHERE " + " AND ".join(conditions)
+    try:
+        return _read_sql(conn, q, tuple(params))
+    finally:
+        conn.close()
+
+
+def get_range_breakout_episodes(status: str = None, pattern_type: str = None) -> pd.DataFrame:
+    conn = _connect()
+    q = "SELECT * FROM range_breakout_episodes"
+    params: list = []
+    conditions = []
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if pattern_type:
+        conditions.append("pattern_type = ?")
+        params.append(pattern_type)
     if conditions:
         q += " WHERE " + " AND ".join(conditions)
     try:

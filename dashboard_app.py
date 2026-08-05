@@ -66,6 +66,7 @@ import page_s1_shift
 import page_breakout_pullback
 import page_ema_pullback
 import page_vwap_sr
+import page_range_breakout
 
 pages = [
     st.Page(legacy_dashboard.render, title="Dashboard (Classic)", icon="🏠",
@@ -77,6 +78,7 @@ pages = [
     st.Page(page_breakout_pullback.render, title="Breakout-Pullback", icon="📈", url_path="breakout-pullback"),
     st.Page(page_ema_pullback.render, title="EMA Pullback", icon="🔁", url_path="ema-pullback"),
     st.Page(page_vwap_sr.render, title="VWAP S/R (Pilot)", icon="🧪", url_path="vwap-sr"),
+    st.Page(page_range_breakout.render, title="Range Breakout (5-Leg)", icon="📊", url_path="range-breakout"),
 ]
 
 nav = st.navigation(pages, position="top")

@@ -1,0 +1,18 @@
+diff --git a/vwap_support_resistance_pattern.py b/vwap_support_resistance_pattern.py
+--- a/vwap_support_resistance_pattern.py
++++ b/vwap_support_resistance_pattern.py
+@@ -106,7 +106,12 @@
+     for session_date, day_df in df.groupby("_date"):
+         day_df = day_df.sort_index()
+         cum_vol = day_df["Volume"].cumsum()
+-        cum_pv = (day_df["_typical"] * day_df["Volume"]).cumsum()
++        # Avoid zero-volume bars corrupting the entire session's VWAP:
++        # mask out zero-volume bars from both cumulative sums so they
++        # don't contribute and don't create NaN via division by zero.
++        _vol = day_df["Volume"].replace(0, np.nan)
++        _typical = day_df["_typical"]
++        cum_vol = _vol.cumsum()
++        cum_pv = (_typical * _vol).cumsum()
+         vwap_series = cum_pv / cum_vol.replace(0, np.nan)
+
+         final_vwap = float(vwap_series.iloc[-1])

@@ -1,7 +1,7 @@
 """
 app_globals.py
 ----------------
-Shared global sidebar + data-loading step, callable from every page.
+Shared global sidebar and data-loading step, callable from every page  .
 """
 from datetime import datetime
 
@@ -52,6 +52,7 @@ def load_globals():
         core.load_supertrend_ledger.clear()
         core.load_confluence_table_cached.clear()
         core.load_fundamental_cache_cached.clear()
+        core.load_range_breakout_ledger.clear()
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filters")
@@ -220,6 +221,24 @@ def load_globals():
     st_params_list = [_st_params_options[lbl] for lbl in _st_selected_labels] or [(7, 3.0)]
 
     st.sidebar.markdown("---")
+    st.sidebar.subheader("📊 Range Breakout (5-Leg)")
+    st.sidebar.caption(
+        "Daily timeframe with monthly standard pivot points. 5-leg pattern: "
+        "up-down-up-down-up. Signal appears once Leg 4 retests Leg 2 Low. "
+        "Breakout confirmed when monthly pivot closes above Leg 1 High."
+    )
+    range_breakout_retest_pct = st.sidebar.slider(
+        "Retest band % (around Leg 2 Low)", min_value=0.0, max_value=20.0,
+        value=5.0, step=0.5, key="rb_retest_pct",
+        help="How close price must come to Leg 2 Low to count as a retest.",
+    )
+    range_breakout_fail_pct = st.sidebar.slider(
+        "False breakdown threshold % (below Leg 2 Low)", min_value=0.0, max_value=30.0,
+        value=8.0, step=0.5, key="rb_fail_pct",
+        help="How far below Leg 2 Low counts as a false breakdown.",
+    )
+
+    st.sidebar.markdown("---")
     st.sidebar.caption(
         "Data: Yahoo Finance (via `yfinance`), free & no API key.\n\n"
         "Prices cached 15 min per session to avoid rate limits."
@@ -244,6 +263,8 @@ def load_globals():
             fail_pct=float(fail_pct),
             min_qualify_days=int(min_qualify_days),
             st_params_list=st_params_list,
+            range_breakout_retest_pct=float(range_breakout_retest_pct),
+            range_breakout_fail_pct=float(range_breakout_fail_pct),
         )
 
     if metrics_df.empty:
@@ -272,6 +293,8 @@ def load_globals():
         "fail_pct": fail_pct,
         "min_qualify_days": min_qualify_days,
         "st_params_list": st_params_list,
+        "range_breakout_retest_pct": range_breakout_retest_pct,
+        "range_breakout_fail_pct": range_breakout_fail_pct,
         "metrics_df": metrics_df,
         "merged": merged,
     }

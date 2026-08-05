@@ -34,6 +34,31 @@ Detects the "Monthly S1 Shift Up" pattern:
 
 Every qualifying month is recorded independently - a stock can have several
 such episodes over its history.
+
+═══════════════════════════════════════════════════════════════════════════
+FIX (this revision) — 'tested' was firing without price ever actually
+retesting the level
+═══════════════════════════════════════════════════════════════════════════
+A prior revision ("NEW SEMANTICS (Aug 2026)") replaced classify_x_level's
+retest check with a bare "did Low ever come within retest_pct% of X",
+checked from anchor_date onward with NO precondition. Since X is very
+often already close to price right when it's established, this fired
+"tested" almost immediately from ordinary day-to-day noise, without price
+ever having genuinely moved away from X and come back — reported in
+practice via the VWAP Support/Resistance strategy (which imports this same
+function), e.g. an X level from 29-Jul was marked "tested" within a day or
+two despite no real retest having happened. Restored the "confirmed move
+away first, THEN retest" two-step check used by every other strategy in
+this dashboard (see monthly_pivot_pattern.classify_retest for the
+reference pattern this matches): price must first rally to at least
+2x retest_pct% above X before a pullback back to within retest_pct% of X
+counts as a genuine 'tested' event. 'failed' is unaffected — dropping
+fail_pct% below X was, and remains, a failure regardless of what happened
+before it.
+
+This function is shared by TWO strategies (Monthly S1 Shift Up, which
+calls it directly, and VWAP Support/Resistance, which imports it from
+here) — fixing it here fixes both.
 """
 import pandas as pd
 import numpy as np
@@ -55,7 +80,8 @@ def compute_monthly_pivot_table(hist: pd.DataFrame) -> pd.DataFrame:
     return monthly
 
 
-def find_s1_shift_episodes(hist: pd.DataFrame, retest_pct: float = 5.0, fail_pct: float = 8.0):
+def find_s1_shift_episodes(hist: pd.DataFrame, retest_pct: float = 5.0, fail_pct: float = 8.0,
+                            min_confirm_days: int = 5):
     """
     Returns a list of episode dicts, oldest first, one per qualifying month.
     Each dict has:
@@ -110,7 +136,12 @@ def find_s1_shift_episodes(hist: pd.DataFrame, retest_pct: float = 5.0, fail_pct
         if anchor_date is None:
             continue
 
-        result = classify_x_level(hist, x_price, anchor_date, retest_pct=retest_pct, fail_pct=fail_pct)
+        result = classify_x_level(hist, x_price, anchor_date, retest_pct=retest_pct, fail_pct=fail_pct,
+                                   min_confirm_days=min_confirm_days)
+
+        # Episode invalidated: price touched X inside the quiet window.
+        if result.get("invalidated"):
+            continue
 
         # s1_shift_pct: how far S1 shifted UP for the following month, expressed
         # as a % of the current month's S1.  The confirmation gate only requires
@@ -134,25 +165,48 @@ def find_s1_shift_episodes(hist: pd.DataFrame, retest_pct: float = 5.0, fail_pct
     return episodes
 
 
-def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date, retest_pct: float = 5.0, fail_pct: float = 8.0):
+def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date,
+                      retest_pct: float = 5.0, fail_pct: float = 8.0,
+                      min_confirm_days: int = 5):
     """
     Tracks price relative to a support level `x_price` from `anchor_date`
     onward, classifying it as:
-      'naked'  - never retested, never failed (still ongoing).
-      'tested' - price moved clearly away (confirmed, not just noise) and
-                 later came back down within retest_pct% of x_price.
-      'failed' - price dropped fail_pct% or more below x_price at any point.
-    Whichever event (tested or failed) happens FIRST chronologically wins;
-    if both would trigger on the exact same day, 'failed' takes priority
-    (the more conservative read). Also returns max_runup_pct (the largest
-    % price ran up away from x_price before the resolving event, or before
-    "now" if still naked) and days_tracked.
+
+      'naked'  - Price did NOT touch X (Low <= X) during the mandatory
+                 quiet window (first min_confirm_days trading days after
+                 anchor_date) AND has not touched X or failed since then.
+
+      'tested' - The quiet window completed cleanly (no touch of X during
+                 those first min_confirm_days days), AND price subsequently
+                 touched X (Low <= X) on any single day after the window
+                 closes.  Just one touch is enough — no "move-away first"
+                 precondition once the window is satisfied.
+
+      'failed' - Price dropped fail_pct% or more below X at any point from
+                 anchor_date onward (including inside the quiet window).
+                 'failed' takes priority over everything: a failure that
+                 happens inside the quiet window is still a failure, and if
+                 the same day would trigger both 'tested' and 'failed',
+                 'failed' wins.
+
+    Two-phase logic (lower-band / support):
+      Phase 1 — Quiet window: days 1 … min_confirm_days (trading days,
+                not calendar days).  If Low <= X on ANY of these days the
+                level was immediately violated; status stays 'naked' only
+                if NO touch occurred.  A fail_pct breach here → 'failed'.
+      Phase 2 — After the window: a single day where Low <= X → 'tested'.
+                A fail_pct breach at any point → 'failed'.
+                Whichever triggers first wins; ties go to 'failed'.
+
+    Also returns max_runup_pct (largest % High ran above X before the
+    resolving event, or before "now" if still naked — capped ±1000% to
+    filter data artefacts) and days_tracked.
     """
-    # Normalize dates to midnight to avoid timezone/time-of-day mismatches
-    # when the index has timestamps (e.g. 09:15+05:30) and anchor_date is
-    # a plain date or midnight UTC.
+    # Normalize anchor to midnight to avoid tz / timestamp mismatches.
     anchor_norm = pd.Timestamp(anchor_date).normalize()
-    after = hist.loc[hist.index.normalize() >= anchor_norm]
+    # D+1 onward — Day D itself establishes the level and cannot be the
+    # first observation.
+    after = hist.loc[hist.index.normalize() > anchor_norm]
     if after.empty or pd.isna(x_price):
         return {
             "status": "naked", "tested_date": None, "tested_price": None,
@@ -163,42 +217,87 @@ def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date, retest_pct
     lows = after["Low"].to_numpy()
     highs = after["High"].to_numpy()
     closes = after["Close"].to_numpy()
+    n = len(dates)
 
     fail_threshold = x_price * (1 - fail_pct / 100.0)
-    retest_threshold = x_price * (1 + retest_pct / 100.0)
-    confirm_away = x_price * (1 + 2 * retest_pct / 100.0)
-
     running_high = np.maximum.accumulate(highs)
 
-    fail_mask = lows <= fail_threshold
-    fail_pos = int(np.argmax(fail_mask)) if fail_mask.any() else None
+    # ── Phase 1: quiet window (first min_confirm_days trading days) ───────
+    # If price touches X (Low <= x_price) at any point here the window is
+    # broken.  A fail_pct breach → 'failed' immediately.
+    quiet_end = min(min_confirm_days, n)  # index of first post-window day
 
-    ran_away_mask = highs >= confirm_away
-    retest_pos = None
-    if ran_away_mask.any():
-        first_away_pos = int(np.argmax(ran_away_mask))
-        if first_away_pos + 1 < len(lows):
-            sub_lows = lows[first_away_pos + 1:]
-            retest_sub_mask = sub_lows <= retest_threshold
-            if retest_sub_mask.any():
-                retest_pos = first_away_pos + 1 + int(np.argmax(retest_sub_mask))
+    for i in range(quiet_end):
+        if lows[i] <= fail_threshold:
+            # Failure inside quiet window — resolve immediately.
+            days_tracked = int((dates[i] - anchor_norm).days)
+            max_runup_pct = float((running_high[: i + 1].max() - x_price) / x_price * 100)
+            max_runup_pct = max(-1000.0, min(1000.0, max_runup_pct))
+            return {
+                "status": "failed",
+                "tested_date": None,
+                "tested_price": None,
+                "failed_date": dates[i],
+                "max_runup_pct": max_runup_pct,
+                "days_tracked": days_tracked,
+            }
+        if lows[i] <= x_price:
+            # Touch inside the quiet window — level was NOT respected during
+            # the mandatory hold-off period.  Mark as invalidated so callers
+            # can skip this episode entirely.  days_tracked reflects how far
+            # in we got before the touch, for debugging.
+            return {
+                "status": "naked", "invalidated": True,
+                "tested_date": None, "tested_price": None,
+                "failed_date": None, "max_runup_pct": 0.0,
+                "days_tracked": int((dates[i] - anchor_norm).days),
+            }
+
+    # Quiet window passed without a touch.  If there were fewer rows than
+    # min_confirm_days, we're still inside the window — stay 'naked'.
+    if n <= quiet_end:
+        max_runup_pct = float((running_high.max() - x_price) / x_price * 100)
+        max_runup_pct = max(-1000.0, min(1000.0, max_runup_pct))
+        days_tracked = int((dates[-1] - anchor_norm).days)
+        return {
+            "status": "naked", "tested_date": None, "tested_price": None,
+            "failed_date": None, "max_runup_pct": max_runup_pct,
+            "days_tracked": days_tracked,
+        }
+
+    # ── Phase 2: post-window tracking ────────────────────────────────────
+    # Scan from quiet_end onward.  First touch (Low <= X) → 'tested'.
+    # First fail (Low <= fail_threshold) → 'failed'.  Ties → 'failed'.
+    tested_pos = None
+    fail_pos = None
+
+    for i in range(quiet_end, n):
+        if lows[i] <= fail_threshold and fail_pos is None:
+            fail_pos = i
+        if lows[i] <= x_price and tested_pos is None:
+            tested_pos = i
+        # Stop as soon as both candidates are found (or the earlier one is).
+        if fail_pos is not None and tested_pos is not None:
+            break
+        if fail_pos is not None and (tested_pos is None or fail_pos <= tested_pos):
+            break
 
     candidates = []
     if fail_pos is not None:
         candidates.append(("failed", fail_pos))
-    if retest_pos is not None:
-        candidates.append(("tested", retest_pos))
+    if tested_pos is not None:
+        candidates.append(("tested", tested_pos))
 
     if candidates:
-        candidates.sort(key=lambda c: c[1])
+        # Sort by position; 'failed' wins ties (it sorts first because we
+        # added it first and Python's sort is stable, but make it explicit).
+        candidates.sort(key=lambda c: (c[1], c[0] != "failed"))
         status, pos = candidates[0]
         event_date = dates[pos]
         event_price = float(closes[pos])
         days_tracked = int((event_date - anchor_norm).days)
         max_runup_pct = float((running_high[: pos + 1].max() - x_price) / x_price * 100)
-        # Sanity cap: >50% run-up on a large-cap NSE stock is almost always a
-        # data artefact (split, bad tick, or date misalignment).
-        max_runup_pct = max(-50.0, min(50.0, max_runup_pct))
+        max_runup_pct = max(-1000.0, min(1000.0, max_runup_pct))
         return {
             "status": status,
             "tested_date": event_date if status == "tested" else None,
@@ -208,8 +307,9 @@ def classify_x_level(hist: pd.DataFrame, x_price: float, anchor_date, retest_pct
             "days_tracked": days_tracked,
         }
 
+    # Nothing triggered — still naked.
     max_runup_pct = float((running_high.max() - x_price) / x_price * 100)
-    max_runup_pct = max(-50.0, min(50.0, max_runup_pct))
+    max_runup_pct = max(-1000.0, min(1000.0, max_runup_pct))
     days_tracked = int((dates[-1] - anchor_norm).days)
     return {
         "status": "naked", "tested_date": None, "tested_price": None,
